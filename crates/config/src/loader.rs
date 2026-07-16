@@ -38,6 +38,12 @@ static DRY_RUN_MIN_SHARES: LazyLock<Positive<FractionalShares>> = LazyLock::new(
 const MIN_COUNTER_TRADE_SLIPPAGE_BPS: u16 = 1;
 const MAX_EXTENDED_HOURS_REPRICE_TIMEOUT_SECS: u64 =
     chrono::TimeDelta::MAX.num_seconds().unsigned_abs();
+/// Same bound as the reprice timeout: `CloseFlattenPolicy::from_secs` builds
+/// a `chrono::Duration` from this value, which fails with an opaque
+/// `OutOfRangeError` past `chrono::TimeDelta::MAX`. Bounding it here at
+/// config-load time gives a clear, actionable error instead.
+const MAX_EXTENDED_HOURS_CLOSE_FLATTEN_WINDOW_SECS: u64 =
+    chrono::TimeDelta::MAX.num_seconds().unsigned_abs();
 /// Slippage must be strictly less than 100%: 10_000 bps (exactly 100%) zeroes a
 /// sell-side limit price and fails `Positive::new` at runtime.
 ///
@@ -403,6 +409,7 @@ struct TokenizationConfig {
 struct BrokerConfig {
     counter_trade_slippage_bps: Option<u16>,
     extended_hours_reprice_timeout_secs: Option<u64>,
+    extended_hours_close_flatten_window_secs: Option<u64>,
     travel_rule: Option<TravelRuleConfig>,
 }
 
@@ -478,6 +485,27 @@ impl BrokerConfig {
 
         Ok(configured)
     }
+
+    fn extended_hours_close_flatten_window_secs(&self) -> Result<u64, CtxError> {
+        let configured = self
+            .extended_hours_close_flatten_window_secs
+            .ok_or(CtxError::MissingExtendedHoursCloseFlattenWindow)?;
+
+        if configured == 0 {
+            return Err(CtxError::ZeroPollingInterval {
+                field: "broker.extended_hours_close_flatten_window_secs",
+            });
+        }
+
+        if configured > MAX_EXTENDED_HOURS_CLOSE_FLATTEN_WINDOW_SECS {
+            return Err(CtxError::ExtendedHoursCloseFlattenWindowOutOfRange {
+                configured,
+                max: MAX_EXTENDED_HOURS_CLOSE_FLATTEN_WINDOW_SECS,
+            });
+        }
+
+        Ok(configured)
+    }
 }
 
 impl std::fmt::Debug for TravelRuleConfig {
@@ -548,6 +576,10 @@ pub struct Ctx {
     /// Maximum age (seconds) for a live extended-hours limit hedge before it is
     /// cancelled so the next scan can place a fresh marketable limit.
     pub extended_hours_reprice_timeout_secs: u64,
+    /// Window (seconds) before a long-gap extended-session close during which
+    /// the bot repeatedly cancels, refreshes, and replaces executable residual
+    /// exposure with quote-crossing limits.
+    pub extended_hours_close_flatten_window_secs: u64,
     pub apalis_finished_job_cleanup_interval_secs: u64,
     pub broker: BrokerCtx,
     pub telemetry: Option<TelemetryCtx>,
@@ -651,6 +683,10 @@ impl std::fmt::Debug for Ctx {
                 &self.extended_hours_reprice_timeout_secs,
             )
             .field(
+                "extended_hours_close_flatten_window_secs",
+                &self.extended_hours_close_flatten_window_secs,
+            )
+            .field(
                 "apalis_finished_job_cleanup_interval_secs",
                 &self.apalis_finished_job_cleanup_interval_secs,
             )
@@ -721,6 +757,7 @@ struct ValidatedParts {
     inventory_poll_interval: u64,
     order_fill_poll_interval: u64,
     extended_hours_reprice_timeout_secs: u64,
+    extended_hours_close_flatten_window_secs: u64,
     apalis_finished_job_cleanup_interval_secs: u64,
     broker: BrokerCtx,
     telemetry: Option<TelemetryCtx>,
@@ -951,11 +988,10 @@ fn parse_and_validate(
         });
     }
 
-    let extended_hours_reprice_timeout_secs = resolve_extended_hours_reprice_timeout_secs(
-        &broker,
-        config.broker.as_ref(),
-        &config.assets,
-    )?;
+    let ExtendedHoursBrokerWindows {
+        reprice_timeout_secs: extended_hours_reprice_timeout_secs,
+        close_flatten_window_secs: extended_hours_close_flatten_window_secs,
+    } = extended_hours_broker_windows(&broker, config.broker.as_ref(), &config.assets)?;
 
     let apalis_finished_job_cleanup_interval_secs =
         config.apalis_finished_job_cleanup_interval_secs;
@@ -998,6 +1034,7 @@ fn parse_and_validate(
         inventory_poll_interval,
         order_fill_poll_interval,
         extended_hours_reprice_timeout_secs,
+        extended_hours_close_flatten_window_secs,
         apalis_finished_job_cleanup_interval_secs,
         broker,
         telemetry,
@@ -1033,6 +1070,42 @@ fn parse_and_validate(
         wallet_inputs,
         wallet_meta,
     })
+}
+
+/// Result of [`extended_hours_broker_windows`]. Both fields are `u64`
+/// seconds with distinct meanings -- a named struct (rather than a
+/// positional tuple) prevents a future reorder at either the construction or
+/// destructuring site from silently swapping which duration feeds which
+/// `Ctx` field.
+struct ExtendedHoursBrokerWindows {
+    reprice_timeout_secs: u64,
+    close_flatten_window_secs: u64,
+}
+
+fn extended_hours_broker_windows(
+    broker: &BrokerCtx,
+    broker_config: Option<&BrokerConfig>,
+    assets: &AssetsConfig,
+) -> Result<ExtendedHoursBrokerWindows, CtxError> {
+    let reprice_timeout_secs =
+        resolve_extended_hours_reprice_timeout_secs(broker, broker_config, assets)?;
+
+    match broker {
+        BrokerCtx::AlpacaBrokerApi(_) => {
+            let broker_config =
+                broker_config.ok_or(CtxError::MissingExtendedHoursRepriceTimeout)?;
+
+            Ok(ExtendedHoursBrokerWindows {
+                reprice_timeout_secs,
+                close_flatten_window_secs: broker_config
+                    .extended_hours_close_flatten_window_secs()?,
+            })
+        }
+        BrokerCtx::DryRun => Ok(ExtendedHoursBrokerWindows {
+            reprice_timeout_secs,
+            close_flatten_window_secs: 0,
+        }),
+    }
 }
 
 /// Assembles the required issuance status context from secrets.
@@ -1092,6 +1165,8 @@ impl Ctx {
             inventory_poll_interval: parts.inventory_poll_interval,
             order_fill_poll_interval: parts.order_fill_poll_interval,
             extended_hours_reprice_timeout_secs: parts.extended_hours_reprice_timeout_secs,
+            extended_hours_close_flatten_window_secs: parts
+                .extended_hours_close_flatten_window_secs,
             apalis_finished_job_cleanup_interval_secs: parts
                 .apalis_finished_job_cleanup_interval_secs,
             broker: parts.broker,
@@ -1361,6 +1436,7 @@ impl Ctx {
             inventory_poll_interval,
             order_fill_poll_interval: 1,
             extended_hours_reprice_timeout_secs: 300,
+            extended_hours_close_flatten_window_secs: 900,
             apalis_finished_job_cleanup_interval_secs,
             broker,
             telemetry: None,
@@ -1435,6 +1511,16 @@ pub enum CtxError {
     )]
     ExtendedHoursRepriceTimeoutOutOfRange { configured: u64, max: u64 },
     #[error(
+        "[broker] extended_hours_close_flatten_window_secs is required when \
+         using Alpaca Broker API"
+    )]
+    MissingExtendedHoursCloseFlattenWindow,
+    #[error(
+        "[broker] extended_hours_close_flatten_window_secs {configured} is out of range; \
+         expected 1..={max}"
+    )]
+    ExtendedHoursCloseFlattenWindowOutOfRange { configured: u64, max: u64 },
+    #[error(
         "[broker] counter_trade_slippage_bps {configured} is out of range; \
          expected {min}..={max}"
     )]
@@ -1483,7 +1569,7 @@ pub enum CtxError {
          execute"
     )]
     ExtendedHoursWithoutCounterTrading { symbol: Symbol },
-    #[error("{field} polling interval must be non-zero")]
+    #[error("{field} must be non-zero")]
     ZeroPollingInterval { field: &'static str },
     #[error("server_port and board_port must differ; both set to {port}")]
     ServerAndBoardPortsMatch { port: u16 },
@@ -1518,6 +1604,12 @@ impl CtxError {
             Self::MissingExtendedHoursRepriceTimeout => "missing extended hours reprice timeout",
             Self::ExtendedHoursRepriceTimeoutOutOfRange { .. } => {
                 "extended hours reprice timeout out of range"
+            }
+            Self::MissingExtendedHoursCloseFlattenWindow => {
+                "missing extended hours close flatten window"
+            }
+            Self::ExtendedHoursCloseFlattenWindowOutOfRange { .. } => {
+                "extended hours close flatten window out of range"
             }
             Self::CounterTradeSlippageBpsOutOfRange { .. } => {
                 "counter trade slippage bps out of range"
@@ -1650,6 +1742,7 @@ pub fn create_test_ctx_with_order_owner(order_owner: Address) -> Ctx {
         inventory_poll_interval: 60,
         order_fill_poll_interval: 5,
         extended_hours_reprice_timeout_secs: 300,
+        extended_hours_close_flatten_window_secs: 900,
         apalis_finished_job_cleanup_interval_secs: 3600,
         broker: BrokerCtx::DryRun,
         telemetry: None,
@@ -1818,6 +1911,7 @@ mod tests {
             [broker]
             counter_trade_slippage_bps = 100
             extended_hours_reprice_timeout_secs = 300
+            extended_hours_close_flatten_window_secs = 900
 
             [broker.travel_rule]
             beneficiary_entity_name = "Test Entity"
@@ -1852,6 +1946,7 @@ mod tests {
             [broker]
             counter_trade_slippage_bps = 100
             extended_hours_reprice_timeout_secs = 300
+            extended_hours_close_flatten_window_secs = 900
 
             [wallet]
             kind = "private-key"
@@ -2652,6 +2747,7 @@ mod tests {
             [broker]
             counter_trade_slippage_bps = 100
             extended_hours_reprice_timeout_secs = 300
+            extended_hours_close_flatten_window_secs = 900
 
             [tokenization]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -2933,6 +3029,7 @@ mod tests {
             [broker]
             counter_trade_slippage_bps = 100
             extended_hours_reprice_timeout_secs = 300
+            extended_hours_close_flatten_window_secs = 900
 
             [tokenization]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -2998,6 +3095,7 @@ mod tests {
             [broker]
             counter_trade_slippage_bps = 100
             extended_hours_reprice_timeout_secs = 300
+            extended_hours_close_flatten_window_secs = 900
 
             [broker.travel_rule]
             beneficiary_entity_name = "Test Corp"
@@ -3071,6 +3169,7 @@ mod tests {
             [broker]
             counter_trade_slippage_bps = 100
             extended_hours_reprice_timeout_secs = 300
+            extended_hours_close_flatten_window_secs = 900
 
             [broker.travel_rule]
             beneficiary_entity_name = "Test Corp"
@@ -3143,6 +3242,7 @@ mod tests {
             [broker]
             counter_trade_slippage_bps = 100
             extended_hours_reprice_timeout_secs = 300
+            extended_hours_close_flatten_window_secs = 900
 
             [broker.travel_rule]
             beneficiary_entity_name = "Test Corp"
@@ -3198,6 +3298,7 @@ mod tests {
             [broker]
             counter_trade_slippage_bps = 100
             extended_hours_reprice_timeout_secs = 300
+            extended_hours_close_flatten_window_secs = 900
 
             [broker.travel_rule]
             beneficiary_entity_name = "Test Corp"
@@ -3333,6 +3434,7 @@ mod tests {
         let broker = BrokerConfig {
             counter_trade_slippage_bps: Some(100),
             extended_hours_reprice_timeout_secs: Some(u64::MAX),
+            extended_hours_close_flatten_window_secs: Some(300),
             travel_rule: None,
         };
 
@@ -3355,12 +3457,171 @@ mod tests {
         let broker = BrokerConfig {
             counter_trade_slippage_bps: Some(100),
             extended_hours_reprice_timeout_secs: Some(MAX_EXTENDED_HOURS_REPRICE_TIMEOUT_SECS),
+            extended_hours_close_flatten_window_secs: Some(300),
             travel_rule: None,
         };
 
         assert_eq!(
             broker.extended_hours_reprice_timeout_secs().unwrap(),
             MAX_EXTENDED_HOURS_REPRICE_TIMEOUT_SECS
+        );
+    }
+
+    #[test]
+    fn extended_hours_close_flatten_window_rejects_values_chrono_cannot_represent() {
+        let broker = BrokerConfig {
+            counter_trade_slippage_bps: Some(100),
+            extended_hours_reprice_timeout_secs: Some(300),
+            extended_hours_close_flatten_window_secs: Some(u64::MAX),
+            travel_rule: None,
+        };
+
+        let error = broker
+            .extended_hours_close_flatten_window_secs()
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                CtxError::ExtendedHoursCloseFlattenWindowOutOfRange {
+                    configured: u64::MAX,
+                    ..
+                }
+            ),
+            "Expected ExtendedHoursCloseFlattenWindowOutOfRange, got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn extended_hours_close_flatten_window_accepts_chrono_maximum() {
+        let broker = BrokerConfig {
+            counter_trade_slippage_bps: Some(100),
+            extended_hours_reprice_timeout_secs: Some(300),
+            extended_hours_close_flatten_window_secs: Some(
+                MAX_EXTENDED_HOURS_CLOSE_FLATTEN_WINDOW_SECS,
+            ),
+            travel_rule: None,
+        };
+
+        assert_eq!(
+            broker.extended_hours_close_flatten_window_secs().unwrap(),
+            MAX_EXTENDED_HOURS_CLOSE_FLATTEN_WINDOW_SECS
+        );
+    }
+
+    #[tokio::test]
+    async fn alpaca_broker_api_requires_extended_hours_close_flatten_window_config() {
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+            server_port = 8080
+            board_port = 8081
+            apalis_finished_job_cleanup_interval_secs = 3600
+
+            [assets.equities]
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
+            required_confirmations = 3
+            ingestion_cutoff = "safe"
+
+            [broker]
+            counter_trade_slippage_bps = 100
+            extended_hours_reprice_timeout_secs = 300
+
+            [wallet]
+            kind = "private-key"
+            address = "0x0000000000000000000000000000000000000001"
+        "#,
+        );
+        let secrets = toml_file(
+            r#"
+            [evm]
+            rpc_url = "http://localhost:8545"
+            base_rpc_url = "https://base.example.com"
+            ethereum_rpc_url = "https://mainnet.example.com"
+
+            [broker]
+            type = "alpaca-broker-api"
+            api_key = "test-key"
+            api_secret = "test-secret"
+            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
+
+            [wallet]
+            private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        "#,
+        );
+
+        let err = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
+
+        assert!(
+            matches!(err, CtxError::MissingExtendedHoursCloseFlattenWindow),
+            "Expected MissingExtendedHoursCloseFlattenWindow, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn alpaca_broker_api_rejects_zero_extended_hours_close_flatten_window() {
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+            server_port = 8080
+            board_port = 8081
+            apalis_finished_job_cleanup_interval_secs = 3600
+
+            [assets.equities]
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
+            required_confirmations = 3
+            ingestion_cutoff = "safe"
+
+            [broker]
+            counter_trade_slippage_bps = 100
+            extended_hours_reprice_timeout_secs = 300
+            extended_hours_close_flatten_window_secs = 0
+
+            [wallet]
+            kind = "private-key"
+            address = "0x0000000000000000000000000000000000000001"
+        "#,
+        );
+        let secrets = toml_file(
+            r#"
+            [evm]
+            rpc_url = "http://localhost:8545"
+            base_rpc_url = "https://base.example.com"
+            ethereum_rpc_url = "https://mainnet.example.com"
+
+            [broker]
+            type = "alpaca-broker-api"
+            api_key = "test-key"
+            api_secret = "test-secret"
+            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
+
+            [wallet]
+            private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        "#,
+        );
+
+        let err = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                CtxError::ZeroPollingInterval {
+                    field: "broker.extended_hours_close_flatten_window_secs"
+                }
+            ),
+            "Expected ZeroPollingInterval for extended_hours_close_flatten_window_secs, got: {err:?}"
         );
     }
 
@@ -3445,6 +3706,7 @@ mod tests {
             [broker]
             counter_trade_slippage_bps = 10000
             extended_hours_reprice_timeout_secs = 300
+            extended_hours_close_flatten_window_secs = 900
         "#,
         );
         let secrets = toml_file(
@@ -3502,6 +3764,7 @@ mod tests {
             [broker]
             counter_trade_slippage_bps = 9999
             extended_hours_reprice_timeout_secs = 300
+            extended_hours_close_flatten_window_secs = 900
 
             [broker.travel_rule]
             beneficiary_entity_name = "Test Entity"
@@ -5685,6 +5948,7 @@ mod tests {
             [broker]
             counter_trade_slippage_bps = 100
             extended_hours_reprice_timeout_secs = 300
+            extended_hours_close_flatten_window_secs = 900
 
             [broker.travel_rule]
             beneficiary_entity_name = "Test Corp"
@@ -5739,6 +6003,7 @@ mod tests {
             [broker]
             counter_trade_slippage_bps = 100
             extended_hours_reprice_timeout_secs = 300
+            extended_hours_close_flatten_window_secs = 900
 
             [broker.travel_rule]
             beneficiary_entity_name = "Test Corp"
