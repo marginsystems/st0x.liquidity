@@ -50,7 +50,7 @@ use st0x_raindex::{RaindexService, RaindexVaultId, RevokeOutcome};
 use st0x_registry::SymbolCache;
 use st0x_tokenization::AlpacaTokenizationService;
 use st0x_tokenization::Tokenizer;
-use st0x_wrapper::WrapperService;
+use st0x_wrapper::{Wrapper, WrapperService};
 
 use crate::alerts::{NoopNotifier, NotifierError, TelegramNotifier};
 use crate::conductor::exit::{ConductorExit, MonitorTaskError};
@@ -83,6 +83,7 @@ use crate::performance::HedgeLatencyProjection;
 use crate::performance::equity_timing::EquityTimingProjection;
 use crate::performance::rebalance::RebalanceTimingProjection;
 use crate::performance::reliability::LifecycleFailureProjection;
+use crate::portfolio_snapshot::{PortfolioSnapshot, PortfolioSnapshotProjection};
 use crate::position::{Position, PositionCommand, PositionError, PositionEvent, TradeId};
 use crate::rebalancing::equity::{
     CrossVenueEquityTransfer, EquityTransferServices, ResumeTokenizationAggregate,
@@ -519,6 +520,46 @@ where
     Ok((executor, provider, telemetry_writer, telemetry))
 }
 
+/// Resolves the rebalancing configuration, which is optional.
+///
+/// Standalone mode is a supported deployment, not a failure, so
+/// [`CtxError::NotRebalancing`] maps to `None`. Every other error is a real
+/// misconfiguration and propagates.
+fn optional_rebalancing_ctx(ctx: &Ctx) -> anyhow::Result<Option<RebalancingCtx>> {
+    match ctx.rebalancing_ctx() {
+        Ok(rebalancing) => Ok(Some(rebalancing.clone())),
+        Err(CtxError::NotRebalancing) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Resolves the resume-tokenization pair the conductor builder expects.
+///
+/// The context exists only when BOTH the queue and the recovery transfer are
+/// present (rebalancing enabled). `zip` makes that dual-Some requirement
+/// explicit, so the compiler flags any arm accidentally set without the other.
+/// The queue always resolves to a concrete value: the builder needs one even
+/// when rebalancing is disabled, where it is never consumed.
+fn wire_resume_tokenization(
+    queue: Option<ResumeTokenizationJobQueue>,
+    recovery_transfer: Option<&Arc<CrossVenueEquityTransfer>>,
+    apalis_pool: &apalis_sqlite::SqlitePool,
+) -> (
+    ResumeTokenizationJobQueue,
+    Option<Arc<ResumeTokenizationCtx>>,
+) {
+    let ctx = queue.as_ref().zip(recovery_transfer).map(|(_, transfer)| {
+        Arc::new(ResumeTokenizationCtx {
+            transfer: transfer.clone(),
+        })
+    });
+
+    (
+        queue.unwrap_or_else(|| ResumeTokenizationJobQueue::new(apalis_pool)),
+        ctx,
+    )
+}
+
 impl Conductor {
     pub(crate) async fn run<E>(
         executor_ctx: impl TryIntoExecutor<Executor = E>,
@@ -588,18 +629,16 @@ impl Conductor {
         // deferred-upgrade conflicts), failing the whole boot.
         catch_up_lifecycle_failures(&pool).await?;
 
-        let rebalancing = match ctx.rebalancing_ctx() {
-            Ok(ctx) => Some(ctx.clone()),
-            Err(CtxError::NotRebalancing) => None,
-            Err(error) => return Err(error.into()),
-        };
+        let rebalancing = optional_rebalancing_ctx(&ctx)?;
 
         let PositionAndRebalancing {
             position,
             position_projection,
             snapshot,
+            portfolio_snapshot,
             wallet_polling,
             tokenizer,
+            wrapper,
             service: rebalancing_service,
             recovery_transfer,
             wrapped_equity_recovery_store,
@@ -664,6 +703,7 @@ impl Conductor {
             offchain_order_projection,
             vault_registry,
             snapshot,
+            portfolio_snapshot,
         };
 
         let TradingJobQueues {
@@ -676,6 +716,7 @@ impl Conductor {
             wrapped_equity_recovery_ctx,
             unwrapped_equity_recovery_ctx,
             check_positions_queue,
+            portfolio_snapshot_queue,
         } = setup_trading_job_queues(
             &apalis_pool,
             &job_queue,
@@ -707,8 +748,10 @@ impl Conductor {
             execution_threshold: ctx.execution_threshold,
             frameworks,
             pool,
+            inventory: inventory.clone(),
             wallet_polling,
             tokenizer,
+            wrapper,
             shutdown_token: shutdown_token.clone(),
             #[cfg(any(test, feature = "test-support"))]
             failure_injector,
@@ -718,24 +761,11 @@ impl Conductor {
         // rebalancing service to rebuild tracking during recheck recovery.
         let recovery_rebalancing_service = rebalancing_service.clone();
 
-        // Build ResumeTokenizationCtx only when BOTH the queue and the
-        // recovery_transfer are present (rebalancing enabled). zip() makes the
-        // dual-Some requirement explicit: if either is None the ctx is None,
-        // and the compiler flags any mismatch if one arm is accidentally set
-        // without the other.
-        let resume_tokenization_ctx = resume_tokenization_queue
-            .as_ref()
-            .zip(recovery_transfer.as_ref())
-            .map(|(_, transfer)| {
-                Arc::new(ResumeTokenizationCtx {
-                    transfer: transfer.clone(),
-                })
-            });
-
-        // Provide a fallback empty queue when rebalancing is disabled, so the
-        // builder always receives a concrete queue (it is never consumed).
-        let resume_tokenization_queue = resume_tokenization_queue
-            .unwrap_or_else(|| ResumeTokenizationJobQueue::new(&apalis_pool));
+        let (resume_tokenization_queue, resume_tokenization_ctx) = wire_resume_tokenization(
+            resume_tokenization_queue,
+            recovery_transfer.as_ref(),
+            &apalis_pool,
+        );
 
         let mut conductor = builder::spawn()
             .context(conductor_ctx)
@@ -746,6 +776,7 @@ impl Conductor {
             .reconcile_queue(reconcile_queue)
             .rejection_queue(rejection_queue)
             .check_positions_queue(check_positions_queue)
+            .portfolio_snapshot_queue(portfolio_snapshot_queue)
             .wrapped_equity_recovery_queue(wrapped_equity_recovery_queue)
             .maybe_wrapped_equity_recovery_ctx(wrapped_equity_recovery_ctx)
             .unwrapped_equity_recovery_queue(unwrapped_equity_recovery_queue)
@@ -958,10 +989,7 @@ async fn grant_startup_token_approvals(ctx: &Ctx) -> anyhow::Result<()> {
         Err(error) => return Err(error.into()),
     };
 
-    let wrapper = WrapperService::new(
-        base_wallet.clone(),
-        to_wrapped_equities(&ctx.assets.equities.symbols),
-    );
+    let wrapper = build_wrapper(base_wallet.clone(), ctx);
 
     let symbols = ctx
         .assets
@@ -973,7 +1001,7 @@ async fn grant_startup_token_approvals(ctx: &Ctx) -> anyhow::Result<()> {
         })
         .cloned();
 
-    let targets = build_approval_targets(&wrapper, symbols, ctx.evm.orderbook, USDC_BASE)?;
+    let targets = build_approval_targets(wrapper.as_ref(), symbols, ctx.evm.orderbook, USDC_BASE)?;
 
     grant_startup_approvals(&base_wallet, &targets).await?;
 
@@ -1163,6 +1191,7 @@ struct RebalancingInfrastructure {
     position_projection: Arc<Projection<Position>>,
     snapshot: Arc<Store<InventorySnapshot>>,
     tokenizer: Arc<dyn Tokenizer>,
+    wrapper: Arc<dyn Wrapper>,
     service: Arc<RebalancingService>,
     recovery_transfer: Arc<CrossVenueEquityTransfer>,
     wrapped_equity_recovery_store: Arc<Store<WrappedEquityRecovery>>,
@@ -1197,8 +1226,17 @@ struct PositionAndRebalancing {
     position: Arc<Store<Position>>,
     position_projection: Arc<Projection<Position>>,
     snapshot: Arc<Store<InventorySnapshot>>,
+    portfolio_snapshot: Arc<Store<PortfolioSnapshot>>,
     wallet_polling: Option<crate::inventory::WalletPollingCtx>,
     tokenizer: Option<Arc<dyn Tokenizer>>,
+    /// `None` only when no wallet is configured at all: without one, the bot
+    /// can never hold onchain (wrapped) equity in the first place, so the
+    /// portfolio-snapshot capture gate never actually needs to resolve a
+    /// vault ratio in that case (`crate::portfolio_snapshot::write`). `Some`
+    /// regardless of whether rebalancing itself is enabled -- a wallet can be
+    /// configured for trading alone (`TradingMode::Standalone`), and market
+    /// making still holds wrapped vault shares in that mode.
+    wrapper: Option<Arc<dyn Wrapper>>,
     service: Option<Arc<RebalancingService>>,
     recovery_transfer: Option<Arc<CrossVenueEquityTransfer>>,
     wrapped_equity_recovery_store: Option<Arc<Store<WrappedEquityRecovery>>>,
@@ -1212,11 +1250,35 @@ struct PositionAndRebalancing {
     resume_tokenization_queue: Option<ResumeTokenizationJobQueue>,
 }
 
+/// Builds the wrapper service from the single wallet/config source shared by
+/// startup approvals, portfolio snapshots, and rebalancing.
+fn build_wrapper<Chain: Wallet + Clone>(
+    base_wallet: Chain,
+    ctx: &Ctx,
+) -> Arc<WrapperService<Chain>> {
+    Arc::new(WrapperService::new(
+        base_wallet,
+        to_wrapped_equities(&ctx.assets.equities.symbols),
+    ))
+}
+
 impl PositionAndRebalancing {
     async fn setup(
         rebalancing: Option<RebalancingCtx>,
         deps: RebalancingDeps,
     ) -> anyhow::Result<Self> {
+        // Built exactly once, regardless of whether rebalancing is enabled:
+        // daily portfolio capture must happen independent of rebalancing
+        // mode, and the Single-Framework-Instance rule (docs/cqrs.md)
+        // forbids building a second Store<PortfolioSnapshot> in either
+        // branch below.
+        let portfolio_snapshot = StoreBuilder::<PortfolioSnapshot>::new(deps.pool.clone())
+            .with(Arc::new(PortfolioSnapshotProjection::new(
+                deps.pool.clone(),
+            )))
+            .build(())
+            .await?;
+
         if let Some(rebalancing_ctx) = rebalancing {
             let wallet_ctx = deps.ctx.wallet()?;
             let ethereum_wallet = wallet_ctx.ethereum_wallet().clone();
@@ -1250,8 +1312,10 @@ impl PositionAndRebalancing {
                 position: infra.position,
                 position_projection: infra.position_projection,
                 snapshot: infra.snapshot,
+                portfolio_snapshot,
                 wallet_polling: Some(wallet_polling),
                 tokenizer: Some(infra.tokenizer),
+                wrapper: Some(infra.wrapper),
                 service: Some(infra.service),
                 recovery_transfer: Some(infra.recovery_transfer),
                 wrapped_equity_recovery_store: Some(infra.wrapped_equity_recovery_store),
@@ -1269,6 +1333,7 @@ impl PositionAndRebalancing {
         } else {
             let RebalancingDeps {
                 pool,
+                ctx,
                 inventory,
                 event_sender,
                 ..
@@ -1285,12 +1350,25 @@ impl PositionAndRebalancing {
                 .build(())
                 .await?;
 
+            // Rebalancing itself may be disabled (`TradingMode::Standalone`)
+            // while a wallet is still configured for trading alone -- market
+            // making then still holds wrapped vault shares onchain, so the
+            // portfolio-snapshot job still needs a ratio source. Mirrors
+            // `grant_startup_token_approvals`'s wallet-presence check.
+            let wrapper: Option<Arc<dyn Wrapper>> = match ctx.wallet() {
+                Ok(wallet_ctx) => Some(build_wrapper(wallet_ctx.base_wallet().clone(), &ctx)),
+                Err(CtxError::WalletNotConfigured) => None,
+                Err(error) => return Err(error.into()),
+            };
+
             Ok(Self {
                 position,
                 position_projection,
                 snapshot,
+                portfolio_snapshot,
                 wallet_polling: None,
                 tokenizer: None,
+                wrapper,
                 service: None,
                 recovery_transfer: None,
                 wrapped_equity_recovery_store: None,
@@ -1521,10 +1599,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
 
         let tokenizer: Arc<dyn Tokenizer> = tokenization;
 
-        let wrapper = Arc::new(WrapperService::new(
-            base_wallet.clone(),
-            to_wrapped_equities(&deps.ctx.assets.equities.symbols),
-        ));
+        let wrapper = build_wrapper(base_wallet.clone(), &deps.ctx);
 
         let equity_transfer_services = EquityTransferServices {
             raindex: raindex_service.clone(),
@@ -1693,6 +1768,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             position_projection: built.position_projection,
             snapshot: built.snapshot,
             tokenizer,
+            wrapper,
             service: rebalancing_service,
             recovery_transfer,
             wrapped_equity_recovery_store,
@@ -5484,6 +5560,12 @@ mod tests {
             .await
             .unwrap();
 
+        let portfolio_snapshot = StoreBuilder::<PortfolioSnapshot>::new(pool.clone())
+            .with(Arc::new(PortfolioSnapshotProjection::new(pool.clone())))
+            .build(())
+            .await
+            .unwrap();
+
         (
             CqrsFrameworks {
                 onchain_trade,
@@ -5493,6 +5575,7 @@ mod tests {
                 offchain_order_projection: offchain_order_projection.clone(),
                 vault_registry,
                 snapshot,
+                portfolio_snapshot,
             },
             offchain_order_projection,
         )
