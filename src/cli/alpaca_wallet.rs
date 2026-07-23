@@ -761,6 +761,7 @@ mod tests {
             rest_api: None,
             issuance: create_test_issuance_ctx(),
             redemption_wallet: None,
+            bot_gas_valuation: None,
         }
     }
 
@@ -861,6 +862,7 @@ mod tests {
             rest_api: None,
             issuance: create_test_issuance_ctx(),
             redemption_wallet: Some(Address::ZERO),
+            bot_gas_valuation: None,
         }
     }
 

@@ -41,7 +41,7 @@ use st0x_event_sorcery::{
 };
 use st0x_evm::{OpenChainErrorRegistry, USDC_BASE, Wallet};
 use st0x_execution::{
-    AlpacaBrokerApi, AlpacaWalletService, ClientOrderId, CounterTradePreflight,
+    AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaWalletService, ClientOrderId, CounterTradePreflight,
     CounterTradeReservation, CounterTradeSkipReason, ExecutionError, Executor, FractionalShares,
     MarketOrder, MarketSession, Symbol, TryIntoExecutor,
 };
@@ -53,6 +53,10 @@ use st0x_tokenization::Tokenizer;
 use st0x_wrapper::WrapperService;
 
 use crate::alerts::{NoopNotifier, NotifierError, TelegramNotifier};
+use crate::bot_gas::{
+    BotGasCostLedger, BotGasReceiptCost, BotGasReceiptCostEnqueuer, RecordBotGasReceiptCostCtx,
+    RecordBotGasReceiptCostJobQueue,
+};
 use crate::conductor::exit::{ConductorExit, MonitorTaskError};
 use crate::conductor::monitor::order_fills::{CutoffProbe, probe_cutoff_block_support};
 use crate::dashboard::Broadcaster;
@@ -322,6 +326,73 @@ async fn requeue_startup_orphans(
     requeue_backfill_orphans(backfill_queue).await
 }
 
+/// Borrowed dependencies for [`finish_startup_recovery`]. Bundled into a
+/// struct (rather than passed as individual arguments) to stay under the
+/// crate's argument-count lint -- the phase genuinely needs every one of
+/// these to requeue orphans, re-arm the bot-gas recovery queue, and hydrate
+/// inventory.
+struct StartupRecoveryDeps<'startup> {
+    schedulers: &'startup RebalancingSchedulers,
+    backfill_queue: &'startup BackfillJobQueue,
+    usdc_to_hedging_ctx: Option<&'startup Arc<TransferUsdcToHedgingCtx>>,
+    usdc_to_market_making_ctx: Option<&'startup Arc<TransferUsdcToMarketMakingCtx>>,
+    equity_to_market_making_ctx: Option<&'startup Arc<TransferEquityToMarketMakingCtx>>,
+    equity_to_hedging_ctx: Option<&'startup Arc<TransferEquityToHedgingCtx>>,
+    record_bot_gas_receipt_cost_queue: &'startup RecordBotGasReceiptCostJobQueue,
+    record_bot_gas_receipt_cost_ctx: Option<&'startup Arc<RecordBotGasReceiptCostCtx>>,
+    pool: &'startup SqlitePool,
+    inventory: &'startup Arc<BroadcastingInventory>,
+    rebalancing_service: Option<&'startup Arc<RebalancingService>>,
+    position_projection: &'startup Projection<Position>,
+}
+
+/// Runs the startup recovery phase, in order: re-queues orphaned transfer
+/// jobs left in-flight by a previous process, re-queues orphaned bot-gas
+/// receipt-cost recovery jobs (when a worker is registered for them),
+/// restores the in-memory inventory view from its persisted snapshot and
+/// seeds the open-hedge gate, then enqueues wallet-balance recovery for the
+/// current on-chain balances.
+async fn finish_startup_recovery(deps: StartupRecoveryDeps<'_>) -> anyhow::Result<()> {
+    requeue_startup_orphans(
+        deps.schedulers,
+        deps.backfill_queue,
+        deps.usdc_to_hedging_ctx,
+        deps.usdc_to_market_making_ctx,
+        deps.equity_to_market_making_ctx,
+        deps.equity_to_hedging_ctx,
+    )
+    .await?;
+
+    // Gated on the ctx (not just "queue exists"), matching every other
+    // recovery/transfer queue: without a registered worker, promoting an
+    // orphaned row to `Pending` just leaves it stuck Pending instead.
+    if deps.record_bot_gas_receipt_cost_ctx.is_some() {
+        requeue_recovery_orphans(
+            deps.record_bot_gas_receipt_cost_queue,
+            "bot gas receipt cost",
+        )
+        .await?;
+    }
+
+    // Restore the in-memory InventoryView from persisted snapshot state
+    // and seed the open-hedge gate. Without hydration, the first
+    // post-restart poll may emit no events (unchanged values are
+    // deduplicated), leaving the view empty and potentially causing
+    // incorrect rebalancing.
+    restore_inventory_at_boot(
+        deps.pool,
+        deps.inventory,
+        deps.rebalancing_service,
+        deps.position_projection,
+    )
+    .await?;
+    if let Some(service) = deps.rebalancing_service {
+        service.enqueue_recovery_for_current_wallet_balances().await;
+    }
+
+    Ok(())
+}
+
 async fn requeue_transfer_orphans<Task>(
     queue: &job::JobQueue<Task>,
     direction_label: &str,
@@ -519,6 +590,31 @@ where
     Ok((executor, provider, telemetry_writer, telemetry))
 }
 
+/// Builds the `ResumeTokenizationCtx` (only when both the queue and the
+/// recovery transfer are present -- rebalancing enabled) and resolves the
+/// queue itself, falling back to a fresh empty queue when rebalancing is
+/// disabled so the builder always receives a concrete queue.
+fn resolve_resume_tokenization(
+    resume_tokenization_queue: Option<ResumeTokenizationJobQueue>,
+    recovery_transfer: Option<&Arc<CrossVenueEquityTransfer>>,
+    apalis_pool: &apalis_sqlite::SqlitePool,
+) -> (
+    ResumeTokenizationJobQueue,
+    Option<Arc<ResumeTokenizationCtx>>,
+) {
+    let resume_tokenization_queue =
+        resume_tokenization_queue.unwrap_or_else(|| ResumeTokenizationJobQueue::new(apalis_pool));
+
+    let resume_tokenization_ctx = recovery_transfer.map(|transfer| {
+        Arc::new(ResumeTokenizationCtx {
+            transfer: transfer.clone(),
+            job_queue: resume_tokenization_queue.clone(),
+        })
+    });
+
+    (resume_tokenization_queue, resume_tokenization_ctx)
+}
+
 impl Conductor {
     pub(crate) async fn run<E>(
         executor_ctx: impl TryIntoExecutor<Executor = E>,
@@ -558,6 +654,19 @@ impl Conductor {
             StoreBuilder::<VaultRegistry>::new(pool.clone())
                 .build(())
                 .await?;
+
+        // Bot-gas cost recording (ADR 0017). The store and queue are
+        // constructed unconditionally because doing so is cheap and has no
+        // side effects, regardless of trading mode.
+        let bot_gas_receipt_cost_store = StoreBuilder::<BotGasReceiptCost>::new(pool.clone())
+            .build(())
+            .await?;
+        let record_bot_gas_receipt_cost_queue = RecordBotGasReceiptCostJobQueue::new(&apalis_pool);
+        let record_bot_gas_receipt_cost_ctx = build_record_bot_gas_receipt_cost_ctx(
+            &ctx,
+            bot_gas_receipt_cost_store,
+            record_bot_gas_receipt_cost_queue.clone(),
+        )?;
 
         let seed_vault_registry_queue = SeedVaultRegistryJobQueue::new(&apalis_pool);
         let seed_vault_registry_ctx = Arc::new(
@@ -623,35 +732,26 @@ impl Conductor {
                 vault_registry_projection,
                 schedulers: schedulers.clone(),
                 telemetry: telemetry.clone(),
+                record_bot_gas_receipt_cost_queue: record_bot_gas_receipt_cost_queue.clone(),
             },
         )
         .await?;
 
-        requeue_startup_orphans(
-            &schedulers,
-            &backfill_queue,
-            transfer_usdc_to_hedging_ctx.as_ref(),
-            transfer_usdc_to_market_making_ctx.as_ref(),
-            transfer_equity_to_market_making_ctx.as_ref(),
-            transfer_equity_to_hedging_ctx.as_ref(),
-        )
+        finish_startup_recovery(StartupRecoveryDeps {
+            schedulers: &schedulers,
+            backfill_queue: &backfill_queue,
+            usdc_to_hedging_ctx: transfer_usdc_to_hedging_ctx.as_ref(),
+            usdc_to_market_making_ctx: transfer_usdc_to_market_making_ctx.as_ref(),
+            equity_to_market_making_ctx: transfer_equity_to_market_making_ctx.as_ref(),
+            equity_to_hedging_ctx: transfer_equity_to_hedging_ctx.as_ref(),
+            record_bot_gas_receipt_cost_queue: &record_bot_gas_receipt_cost_queue,
+            record_bot_gas_receipt_cost_ctx: record_bot_gas_receipt_cost_ctx.as_ref(),
+            pool: &pool,
+            inventory: &inventory,
+            rebalancing_service: rebalancing_service.as_ref(),
+            position_projection: &position_projection,
+        })
         .await?;
-
-        // Restore the in-memory InventoryView from persisted snapshot state
-        // and seed the open-hedge gate. Without hydration, the first
-        // post-restart poll may emit no events (unchanged values are
-        // deduplicated), leaving the view empty and potentially causing
-        // incorrect rebalancing.
-        restore_inventory_at_boot(
-            &pool,
-            &inventory,
-            rebalancing_service.as_ref(),
-            &position_projection,
-        )
-        .await?;
-        if let Some(service) = &rebalancing_service {
-            service.enqueue_recovery_for_current_wallet_balances().await;
-        }
 
         let (offchain_order, offchain_order_projection) =
             setup_offchain_order_store(&pool, &executor, &position, &position_projection).await?;
@@ -718,24 +818,11 @@ impl Conductor {
         // rebalancing service to rebuild tracking during recheck recovery.
         let recovery_rebalancing_service = rebalancing_service.clone();
 
-        // Build ResumeTokenizationCtx only when BOTH the queue and the
-        // recovery_transfer are present (rebalancing enabled). zip() makes the
-        // dual-Some requirement explicit: if either is None the ctx is None,
-        // and the compiler flags any mismatch if one arm is accidentally set
-        // without the other.
-        let resume_tokenization_ctx = resume_tokenization_queue
-            .as_ref()
-            .zip(recovery_transfer.as_ref())
-            .map(|(_, transfer)| {
-                Arc::new(ResumeTokenizationCtx {
-                    transfer: transfer.clone(),
-                })
-            });
-
-        // Provide a fallback empty queue when rebalancing is disabled, so the
-        // builder always receives a concrete queue (it is never consumed).
-        let resume_tokenization_queue = resume_tokenization_queue
-            .unwrap_or_else(|| ResumeTokenizationJobQueue::new(&apalis_pool));
+        let (resume_tokenization_queue, resume_tokenization_ctx) = resolve_resume_tokenization(
+            resume_tokenization_queue,
+            recovery_transfer.as_ref(),
+            &apalis_pool,
+        );
 
         let mut conductor = builder::spawn()
             .context(conductor_ctx)
@@ -765,6 +852,8 @@ impl Conductor {
             .seed_vault_registry_ctx(seed_vault_registry_ctx)
             .resume_tokenization_queue(resume_tokenization_queue)
             .maybe_resume_tokenization_ctx(resume_tokenization_ctx)
+            .record_bot_gas_receipt_cost_queue(record_bot_gas_receipt_cost_queue)
+            .maybe_record_bot_gas_receipt_cost_ctx(record_bot_gas_receipt_cost_ctx)
             .job_cleanup(job_cleanup)
             .telemetry_writer(telemetry_writer)
             .call()?;
@@ -908,6 +997,44 @@ fn build_unwrapped_equity_recovery_ctx(
         queue,
         reschedule_interval,
     }))
+}
+
+/// Builds the [`RecordBotGasReceiptCostCtx`] whenever `[bot_gas_valuation]` is
+/// configured (ADR 0017), independent of trading mode -- `[bot_gas_valuation]`
+/// is mandatory when `[rebalancing]` is configured and optional otherwise, so
+/// this also returns `Some` in Standalone mode if the operator opted in. The
+/// worker is registered either way; in Standalone mode nothing enqueues to it
+/// because every `bot_gas_enqueuer` outside `spawn_rebalancing_infrastructure`
+/// is `Disabled`.
+fn build_record_bot_gas_receipt_cost_ctx(
+    ctx: &Ctx,
+    bot_gas_receipt_cost_store: Arc<Store<BotGasReceiptCost>>,
+    job_queue: RecordBotGasReceiptCostJobQueue,
+) -> anyhow::Result<Option<Arc<RecordBotGasReceiptCostCtx>>> {
+    let Some(bot_gas_valuation) = &ctx.bot_gas_valuation else {
+        return Ok(None);
+    };
+
+    let wallet_ctx = match ctx.wallet() {
+        Ok(wallet_ctx) => wallet_ctx,
+        Err(CtxError::WalletNotConfigured) => {
+            warn!(
+                target: "orderbook",
+                "[bot_gas_valuation] is configured but no wallet is configured -- \
+                 bot gas receipt cost recording is disabled"
+            );
+            return Ok(None);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    Ok(Some(Arc::new(RecordBotGasReceiptCostCtx {
+        base_wallet: wallet_ctx.base_wallet().clone(),
+        ethereum_wallet: wallet_ctx.ethereum_wallet().clone(),
+        pyth_contract: bot_gas_valuation.pyth_contract,
+        eth_usd_feed_id: bot_gas_valuation.eth_usd_feed_id,
+        ledger: BotGasCostLedger::new(bot_gas_receipt_cost_store),
+        job_queue,
+    })))
 }
 
 fn base_wallet_equity_recovery_enabled(ctx: &Ctx, symbol: &Symbol) -> bool {
@@ -1187,6 +1314,7 @@ struct RebalancingDeps {
     vault_registry_projection: Arc<Projection<VaultRegistry>>,
     schedulers: RebalancingSchedulers,
     telemetry: TelemetrySender,
+    record_bot_gas_receipt_cost_queue: RecordBotGasReceiptCostJobQueue,
 }
 
 /// Position + rebalancing-adjacent infrastructure produced during conductor
@@ -1473,6 +1601,51 @@ async fn build_query_frameworks(
     manifest.build(pool.clone(), equity_transfer_services).await
 }
 
+/// Builds the Alpaca wallet client, instrumented broker, and CCTP/raindex
+/// services `RebalancerServices` needs. The telemetry wrap happens here (not
+/// at a lower layer) so rebalancer Alpaca calls emit broker dependency
+/// samples, mirroring the hedge executor's own wrapping.
+async fn build_rebalancer_services<Chain: Wallet + Clone>(
+    alpaca_auth: &AlpacaBrokerApiCtx,
+    ethereum_wallet: Chain,
+    base_wallet: Chain,
+    raindex_service: Arc<RaindexService<Chain>>,
+    rebalancing_ctx: &RebalancingCtx,
+    required_confirmations: u64,
+    telemetry: TelemetrySender,
+) -> anyhow::Result<RebalancerServices<Chain>> {
+    let alpaca_wallet = Arc::new(AlpacaWalletService::new(
+        alpaca_auth.base_url().to_string(),
+        alpaca_auth.account_id,
+        alpaca_auth.api_key.clone(),
+        alpaca_auth.api_secret.clone(),
+    ));
+
+    let broker = InstrumentedAlpacaBroker::new(
+        AlpacaBrokerApi::try_from_ctx(alpaca_auth.clone()).await?,
+        telemetry,
+    );
+
+    RebalancerServices::new(
+        broker,
+        alpaca_wallet,
+        ethereum_wallet,
+        base_wallet,
+        raindex_service,
+        UsdcSettlementParams {
+            attestation_retry_deadline: rebalancing_ctx.attestation_retry_deadline,
+            required_confirmations,
+            #[cfg(feature = "test-support")]
+            circle_api_base: rebalancing_ctx.circle_api_base.clone(),
+            #[cfg(feature = "test-support")]
+            token_messenger: rebalancing_ctx.token_messenger,
+            #[cfg(feature = "test-support")]
+            message_transmitter: rebalancing_ctx.message_transmitter,
+        },
+    )
+    .map_err(Into::into)
+}
+
 fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
     rebalancing_ctx: RebalancingCtx,
     redemption_wallet: Address,
@@ -1492,6 +1665,22 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
         };
 
         let market_maker_wallet = base_wallet.address();
+
+        // This function only runs under `TradingMode::Rebalancing`, which
+        // requires `[wallet]` to be configured (see `CtxError::WalletNotConfigured`),
+        // so `[wallet]` presence is guaranteed here -- unlike
+        // `build_record_bot_gas_receipt_cost_ctx`, which also runs in
+        // Standalone mode and must check both. With that precondition met,
+        // gating on `bot_gas_valuation.is_some()` alone matches
+        // `build_record_bot_gas_receipt_cost_ctx`'s outcome exactly, so the
+        // enqueuer and the registered worker can never disagree: an enqueuer
+        // with no worker would pile up `Pending` rows that nothing ever
+        // drains.
+        let bot_gas_enqueuer = if deps.ctx.bot_gas_valuation.is_some() {
+            BotGasReceiptCostEnqueuer::Enabled(deps.record_bot_gas_receipt_cost_queue.clone())
+        } else {
+            BotGasReceiptCostEnqueuer::Disabled
+        };
 
         // The (orderbook, vault-owner) pair keys both the vault-registry lookup
         // and the rebalancing service's registry reads.
@@ -1531,11 +1720,15 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             vault_lookup: vault_lookup.clone(),
             tokenizer: tokenizer.clone(),
             wrapper: wrapper.clone(),
+            bot_gas_enqueuer: bot_gas_enqueuer.clone(),
         };
 
         let transfer_usdc_to_hedging_queue = deps.schedulers.transfer_usdc_to_hedging.clone();
         let transfer_usdc_to_market_making_queue =
             deps.schedulers.transfer_usdc_to_market_making.clone();
+        let transfer_equity_to_market_making_queue =
+            deps.schedulers.transfer_equity_to_market_making.clone();
+        let transfer_equity_to_hedging_queue = deps.schedulers.transfer_equity_to_hedging.clone();
 
         let usdc_notifier = build_usdc_notifier(deps.ctx.alerts.as_ref())?;
 
@@ -1577,15 +1770,18 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             )
             .await;
 
-        let recovery_transfer = Arc::new(CrossVenueEquityTransfer::new(
-            raindex_service.clone(),
-            vault_lookup.clone(),
-            tokenizer.clone(),
-            wrapper.clone(),
-            market_maker_wallet,
-            built.mint.clone(),
-            built.redemption.clone(),
-        ));
+        let recovery_transfer = Arc::new(
+            CrossVenueEquityTransfer::new(
+                raindex_service.clone(),
+                vault_lookup.clone(),
+                tokenizer.clone(),
+                wrapper.clone(),
+                market_maker_wallet,
+                built.mint.clone(),
+                built.redemption.clone(),
+            )
+            .with_bot_gas_enqueuer(bot_gas_enqueuer.clone()),
+        );
 
         // Built outside `QueryManifest`: services depend on mint/redemption stores
         // that the manifest produces.
@@ -1597,6 +1793,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
                 wrapper.clone(),
                 recovery_transfer.clone(),
                 base_wallet.address(),
+                bot_gas_enqueuer.clone(),
             )
             .await?;
 
@@ -1616,37 +1813,16 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             .recover_usdc_guard(&deps.pool, &built.usdc)
             .await?;
 
-        let alpaca_wallet = Arc::new(AlpacaWalletService::new(
-            alpaca_auth.base_url().to_string(),
-            alpaca_auth.account_id,
-            alpaca_auth.api_key.clone(),
-            alpaca_auth.api_secret.clone(),
-        ));
-
-        // Wrap with telemetry before threading down so rebalancer Alpaca calls
-        // emit broker dependency samples (mirrors hedge executor wrapping).
-        let broker = InstrumentedAlpacaBroker::new(
-            AlpacaBrokerApi::try_from_ctx(alpaca_auth.clone()).await?,
-            deps.telemetry.clone(),
-        );
-
-        let services = RebalancerServices::new(
-            broker,
-            Arc::clone(&alpaca_wallet),
+        let services = build_rebalancer_services(
+            alpaca_auth,
             ethereum_wallet,
             base_wallet,
             raindex_service,
-            UsdcSettlementParams {
-                attestation_retry_deadline: rebalancing_ctx.attestation_retry_deadline,
-                required_confirmations: deps.ctx.evm.required_confirmations,
-                #[cfg(feature = "test-support")]
-                circle_api_base: rebalancing_ctx.circle_api_base.clone(),
-                #[cfg(feature = "test-support")]
-                token_messenger: rebalancing_ctx.token_messenger,
-                #[cfg(feature = "test-support")]
-                message_transmitter: rebalancing_ctx.message_transmitter,
-            },
-        )?;
+            &rebalancing_ctx,
+            deps.ctx.evm.required_confirmations,
+            deps.telemetry.clone(),
+        )
+        .await?;
 
         let usdc_vault_id = deps
             .ctx
@@ -1660,6 +1836,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             market_maker_wallet,
             RaindexVaultId(usdc_vault_id),
             built.usdc,
+            bot_gas_enqueuer.clone(),
         );
 
         let transfer_usdc_to_market_making_ctx = Arc::new(TransferUsdcToMarketMakingCtx {
@@ -1682,10 +1859,12 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             equity_in_progress: rebalancing_service.equity_in_progress.clone(),
             mint_store: built.mint.clone(),
             equities_config: deps.ctx.assets.equities.clone(),
+            job_queue: transfer_equity_to_market_making_queue,
         });
 
         let transfer_equity_to_hedging_ctx = Arc::new(TransferEquityToHedgingCtx {
             transfer: recovery_transfer.clone(),
+            job_queue: transfer_equity_to_hedging_queue,
         });
 
         Ok(RebalancingInfrastructure {
@@ -1760,6 +1939,7 @@ async fn build_equity_recovery_stores<Chain: Wallet + Clone>(
     wrapper: Arc<WrapperService<Chain>>,
     transfer: Arc<CrossVenueEquityTransfer>,
     wallet: Address,
+    bot_gas_enqueuer: BotGasReceiptCostEnqueuer,
 ) -> anyhow::Result<(
     Arc<Store<WrappedEquityRecovery>>,
     Arc<Store<UnwrappedEquityRecovery>>,
@@ -1770,6 +1950,7 @@ async fn build_equity_recovery_stores<Chain: Wallet + Clone>(
             vault_lookup: vault_lookup.clone(),
             wrapper: wrapper.clone(),
             transfer: transfer.clone(),
+            bot_gas_enqueuer: bot_gas_enqueuer.clone(),
         })
         .await?;
 
@@ -1780,6 +1961,7 @@ async fn build_equity_recovery_stores<Chain: Wallet + Clone>(
             wrapper,
             transfer,
             wallet,
+            bot_gas_enqueuer,
         })
         .await?;
 
@@ -3595,7 +3777,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, B256, TxHash, U256, address, bytes, fixed_bytes};
+    use alloy::primitives::{Address, B256, TxHash, U256, address, b256, bytes, fixed_bytes};
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
     use apalis::prelude::Status;
@@ -3609,8 +3791,8 @@ mod tests {
     use url::Url;
 
     use st0x_config::{
-        AssetsConfig, EquitiesConfig, EquityAssetConfig, ExecutionThreshold, OperationMode,
-        create_test_ctx_with_order_owner, test_issuance_status_ctx,
+        AssetsConfig, BotGasValuationConfig, EquitiesConfig, EquityAssetConfig, ExecutionThreshold,
+        OperationMode, create_test_ctx_with_order_owner, test_issuance_status_ctx,
     };
     use st0x_dto::Statement;
     use st0x_event_sorcery::{DomainEvent, StoreBuilder, test_store};
@@ -3909,6 +4091,7 @@ mod tests {
             vault_lookup: Arc::new(MockVaultLookup::new()),
             tokenizer: tokenizer.clone(),
             wrapper: wrapper.clone(),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
 
         let seeding_mint_store = Arc::new(test_store::<TokenizedEquityMint>(
@@ -4442,6 +4625,7 @@ mod tests {
             vault_lookup: Arc::new(MockVaultLookup::new()),
             tokenizer: tokenizer.clone(),
             wrapper: wrapper.clone(),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
 
         let seeding_mint_store = Arc::new(test_store::<TokenizedEquityMint>(
@@ -4538,6 +4722,7 @@ mod tests {
             vault_lookup: Arc::new(MockVaultLookup::new()),
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::new()),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
 
         let seeding_mint_store2 = Arc::new(test_store::<TokenizedEquityMint>(
@@ -8456,6 +8641,9 @@ mod tests {
                 vault_registry_projection,
                 schedulers: RebalancingSchedulers::new(&apalis_pool),
                 telemetry: TelemetrySender::disabled(),
+                record_bot_gas_receipt_cost_queue: RecordBotGasReceiptCostJobQueue::new(
+                    &apalis_pool,
+                ),
             },
         )
         .await
@@ -10759,5 +10947,69 @@ mod tests {
 
         build_usdc_notifier(Some(&alerts))
             .expect("a well-formed [alerts] config must yield a notifier, not a startup error");
+    }
+
+    /// A walletless standalone deployment (no `[wallet]`) that still opts into
+    /// `[bot_gas_valuation]` must boot cleanly with bot-gas recording disabled,
+    /// not hard-fail with `WalletNotConfigured` -- mirrors
+    /// `grant_startup_token_approvals`'s handling of the same combination.
+    #[tokio::test]
+    async fn record_bot_gas_receipt_cost_ctx_disabled_without_wallet() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.bot_gas_valuation = Some(BotGasValuationConfig {
+            pyth_contract: address!("0x8250f4aF4B972684F7b336503E2D6dFeDeB1487a"),
+            eth_usd_feed_id: b256!(
+                "0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace"
+            ),
+        });
+
+        let store = StoreBuilder::<BotGasReceiptCost>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let job_queue = RecordBotGasReceiptCostJobQueue::new(&apalis_pool);
+
+        let result = build_record_bot_gas_receipt_cost_ctx(&ctx, store, job_queue).unwrap();
+
+        assert!(
+            result.is_none(),
+            "walletless deployment must disable bot-gas recording, not fail startup"
+        );
+    }
+
+    /// When both `[bot_gas_valuation]` and `[wallet]` are configured, the ctx
+    /// must be built and must thread `pyth_contract`/`eth_usd_feed_id` through
+    /// unchanged -- a regression that unconditionally returned `None` would
+    /// pass every other test in this module, since they only exercise the
+    /// disabled paths.
+    #[tokio::test]
+    async fn record_bot_gas_receipt_cost_ctx_enabled_with_wallet_and_valuation() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+
+        let pyth_contract = address!("0x8250f4aF4B972684F7b336503E2D6dFeDeB1487a");
+        let eth_usd_feed_id =
+            b256!("0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace");
+
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.wallet = Some(st0x_config::OnchainWalletCtx::stub());
+        ctx.bot_gas_valuation = Some(BotGasValuationConfig {
+            pyth_contract,
+            eth_usd_feed_id,
+        });
+
+        let store = StoreBuilder::<BotGasReceiptCost>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let job_queue = RecordBotGasReceiptCostJobQueue::new(&apalis_pool);
+
+        let result = build_record_bot_gas_receipt_cost_ctx(&ctx, store, job_queue)
+            .unwrap()
+            .expect("wallet + bot_gas_valuation configured must build a ctx");
+
+        assert_eq!(result.pyth_contract, pyth_contract);
+        assert_eq!(result.eth_usd_feed_id, eth_usd_feed_id);
     }
 }

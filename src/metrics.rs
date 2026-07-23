@@ -58,6 +58,11 @@ pub(crate) fn setup() -> Result<PrometheusHandle, BuildError> {
         "Inventory OperatorDeposit/OperatorWithdraw legs with no same-tx counterpart in the \
          batch, by leg"
     );
+    metrics::describe_counter!(
+        "bot_gas_redrive_total",
+        "Bot-gas receipt-cost enqueue failures redriven instead of failing the triggering \
+         job, by job"
+    );
 
     let _ = HANDLE.set(handle.clone());
     Ok(handle)

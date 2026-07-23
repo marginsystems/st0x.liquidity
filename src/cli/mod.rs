@@ -27,6 +27,8 @@ use st0x_execution::{AlpacaAccountId, Direction, FractionalShares, Positive, Sym
 use st0x_finance::Usdc;
 use st0x_registry::SymbolCache;
 
+#[cfg(test)]
+use crate::bot_gas::BotGasReceiptCostEnqueuer;
 use crate::offchain::order::{OffchainOrder, OffchainOrderId, OrderPlacer};
 use crate::performance::equity_timing::EquityTimingProjection;
 use crate::performance::rebalance::RebalanceTimingProjection;
@@ -1891,6 +1893,7 @@ mod tests {
             rest_api: None,
             issuance: create_test_issuance_ctx(),
             redemption_wallet: None,
+            bot_gas_valuation: None,
         }
     }
 
@@ -2642,6 +2645,7 @@ mod tests {
                 vault_lookup: Arc::new(MockVaultLookup::new()),
                 tokenizer: Arc::new(MockTokenizer::new()),
                 wrapper: Arc::new(MockWrapper::new()),
+                bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
             })
             .await
             .unwrap();

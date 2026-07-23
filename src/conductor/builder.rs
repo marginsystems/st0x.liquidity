@@ -34,6 +34,11 @@ use super::monitor::gas::{GasMonitor, ProviderBalanceReader};
 use super::monitor::inventory::InventoryMonitor;
 use super::monitor::order_fills::OrderFillMonitor;
 use crate::alerts::TelegramNotifier;
+#[cfg(test)]
+use crate::bot_gas::BotGasReceiptCostEnqueuer;
+use crate::bot_gas::{
+    RecordBotGasReceiptCost, RecordBotGasReceiptCostCtx, RecordBotGasReceiptCostJobQueue,
+};
 use crate::inventory::{
     InventoryPollingService, InventorySnapshot, InventorySnapshotId, WalletPollingCtx,
 };
@@ -179,6 +184,8 @@ pub(crate) fn spawn<Prov, Exec>(
     seed_vault_registry_ctx: Arc<SeedVaultRegistryCtx>,
     resume_tokenization_queue: ResumeTokenizationJobQueue,
     resume_tokenization_ctx: Option<Arc<ResumeTokenizationCtx>>,
+    record_bot_gas_receipt_cost_queue: RecordBotGasReceiptCostJobQueue,
+    record_bot_gas_receipt_cost_ctx: Option<Arc<RecordBotGasReceiptCostCtx>>,
     job_cleanup: JoinHandle<()>,
     telemetry_writer: JoinHandle<()>,
 ) -> Result<Conductor, chrono::OutOfRangeError>
@@ -423,6 +430,8 @@ where
         transfer_equity_to_hedging_ctx,
         resume_tokenization_queue,
         resume_tokenization_ctx,
+        record_bot_gas_receipt_cost_queue,
+        record_bot_gas_receipt_cost_ctx,
         apalis_shutdown_token,
         seed_vault_registry_queue,
         #[cfg(any(test, feature = "test-support"))]
@@ -482,6 +491,8 @@ where
     transfer_equity_to_hedging_ctx: Option<Arc<TransferEquityToHedgingCtx>>,
     resume_tokenization_queue: ResumeTokenizationJobQueue,
     resume_tokenization_ctx: Option<Arc<ResumeTokenizationCtx>>,
+    record_bot_gas_receipt_cost_queue: RecordBotGasReceiptCostJobQueue,
+    record_bot_gas_receipt_cost_ctx: Option<Arc<RecordBotGasReceiptCostCtx>>,
     apalis_shutdown_token: CancellationToken,
     seed_vault_registry_queue: SeedVaultRegistryJobQueue,
     #[cfg(any(test, feature = "test-support"))]
@@ -529,6 +540,8 @@ where
             transfer_equity_to_hedging_ctx,
             resume_tokenization_queue,
             resume_tokenization_ctx,
+            record_bot_gas_receipt_cost_queue,
+            record_bot_gas_receipt_cost_ctx,
             apalis_shutdown_token,
             seed_vault_registry_queue,
             #[cfg(any(test, feature = "test-support"))]
@@ -567,6 +580,8 @@ where
         let failure_injector_for_transfer_equity_to_hedging = failure_injector.clone();
         #[cfg(any(test, feature = "test-support"))]
         let failure_injector_for_resume_tokenization = failure_injector.clone();
+        #[cfg(any(test, feature = "test-support"))]
+        let failure_injector_for_record_bot_gas_receipt_cost = failure_injector.clone();
         let failure_notify = Arc::new(tokio::sync::Notify::new());
         let failure_notify_for_hedge = failure_notify.clone();
         let failure_notify_for_backfill = failure_notify.clone();
@@ -797,6 +812,14 @@ where
                 resume_tokenization_queue,
                 #[cfg(any(test, feature = "test-support"))]
                 failure_injector_for_resume_tokenization,
+            );
+
+            let apalis_monitor = register_record_bot_gas_receipt_cost_worker(
+                apalis_monitor,
+                record_bot_gas_receipt_cost_ctx,
+                record_bot_gas_receipt_cost_queue,
+                #[cfg(any(test, feature = "test-support"))]
+                failure_injector_for_record_bot_gas_receipt_cost,
             );
 
             let is_draining = apalis_shutdown_token.clone();
@@ -1100,6 +1123,40 @@ fn register_resume_tokenization_worker(
     })
 }
 
+/// Conditionally registers the `RecordBotGasReceiptCost` worker. The ctx is
+/// `None` when `[bot_gas_valuation]` is not configured, or when it is
+/// configured but no `[wallet]` is (see `build_record_bot_gas_receipt_cost_ctx`);
+/// in either case the queue exists but no worker consumes it. Best-effort,
+/// matching every other per-item dead-lettering worker: a terminal failure
+/// recording one receipt's cost must never block or slow hedging (see ADR
+/// 0017).
+fn register_record_bot_gas_receipt_cost_worker(
+    monitor: Monitor,
+    record_ctx: Option<Arc<RecordBotGasReceiptCostCtx>>,
+    record_queue: RecordBotGasReceiptCostJobQueue,
+    #[cfg(any(test, feature = "test-support"))] failure_injector: FailureInjector,
+) -> Monitor {
+    let Some(record_ctx) = record_ctx else {
+        debug!(
+            "RecordBotGasReceiptCost worker not registered: [bot_gas_valuation] is not \
+             configured, or is configured without a [wallet]. Bot-gas costs will not be \
+             recorded."
+        );
+        return monitor;
+    };
+
+    monitor.register(move |index| {
+        build_best_effort_worker!(
+            ::<RecordBotGasReceiptCostCtx, RecordBotGasReceiptCost>,
+            index,
+            record_queue.clone(),
+            record_ctx.clone(),
+            #[cfg(any(test, feature = "test-support"))]
+            failure_injector.clone(),
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -1201,6 +1258,7 @@ mod tests {
     fn mint_transfer_ctx(
         transfer: Arc<dyn ResumeEquityToMarketMaking>,
         cqrs_pool: sqlx::SqlitePool,
+        job_queue: TransferEquityToMarketMakingJobQueue,
     ) -> Arc<TransferEquityToMarketMakingCtx> {
         let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
         let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
@@ -1209,6 +1267,7 @@ mod tests {
             vault_lookup: Arc::new(MockVaultLookup::new()),
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper,
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
 
         Arc::new(TransferEquityToMarketMakingCtx {
@@ -1216,6 +1275,7 @@ mod tests {
             equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
             mint_store: Arc::new(test_store(cqrs_pool, services)),
             equities_config: EquitiesConfig::default(),
+            job_queue,
         })
     }
 
@@ -1243,6 +1303,7 @@ mod tests {
                 poison_id,
                 healthy_completed: healthy_completed.clone(),
             }),
+            job_queue: queue.clone(),
         });
         let monitor = register_transfer_equity_to_hedging_worker(
             Monitor::new().should_restart(|_ctx, _error, _attempt| false),
@@ -1310,6 +1371,7 @@ mod tests {
                 healthy_completed: healthy_completed.clone(),
             }),
             cqrs_pool,
+            queue.clone(),
         );
         let monitor = register_transfer_equity_to_market_making_worker(
             Monitor::new().should_restart(|_ctx, _error, _attempt| false),

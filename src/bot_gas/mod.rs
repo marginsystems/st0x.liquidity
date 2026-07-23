@@ -7,12 +7,62 @@ use num_decimal::Num;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
+use tracing::info;
 
 use st0x_event_sorcery::{DomainEvent, EventSourced, Nil, SendError, Store};
 use st0x_finance::Symbol;
 
-const WEI_PER_ETH: &str = "1000000000000000000";
+mod job;
+pub(crate) mod redrive;
+mod valuation;
+
+pub(crate) use job::{
+    BotGasEnqueueFailure, BotGasReceiptCostEnqueuer, RecordBotGasReceiptCost,
+    RecordBotGasReceiptCostCtx, RecordBotGasReceiptCostJobQueue,
+};
+
+/// Builds a [`BotGasEnqueueFailure`] for tests outside this module that need
+/// to construct one (e.g. stubbing a `BotGasEnqueueFailed` domain error).
+/// Keeps `QueuePushFailureKind` module-private -- callers only need a
+/// well-formed failure value, not the classification enum itself.
+#[cfg(test)]
+pub(crate) fn test_bot_gas_enqueue_failure(tx_hash: TxHash) -> BotGasEnqueueFailure {
+    job::test_support::enqueue_failure(tx_hash)
+}
+
+/// Reads back every `Pending` [`RecordBotGasReceiptCost`] job from the apalis
+/// `Jobs` table. Shared by every aggregate's convergence tests (equity mint,
+/// USDC cross-venue transfer, wrapped/unwrapped equity recovery) that assert
+/// on which bot-gas jobs a confirmed tx enqueued.
+#[cfg(test)]
+pub(crate) async fn pending_bot_gas_jobs(
+    apalis_pool: &apalis_sqlite::SqlitePool,
+) -> Vec<RecordBotGasReceiptCost> {
+    let payloads: Vec<Vec<u8>> =
+        sqlx_apalis::query_scalar("SELECT job FROM Jobs WHERE status = 'Pending' AND job_type = ?")
+            .bind(std::any::type_name::<RecordBotGasReceiptCost>())
+            .fetch_all(apalis_pool)
+            .await
+            .unwrap();
+
+    payloads
+        .iter()
+        .map(|payload| serde_json::from_slice(payload).unwrap())
+        .collect()
+}
+
+/// Built once and reused: constructed via `Num::from` (infallible integer
+/// conversion, unlike `Num::from_str`), so re-deriving it on every
+/// `native_cost_usd` call is wasted work rather than a fallible parse.
+static WEI_PER_ETH: LazyLock<Num> = LazyLock::new(|| Num::from(1_000_000_000_000_000_000_u64));
+
+/// Mirrors `num_decimal::Num`'s private `MAX_PRECISION` -- the crate does not
+/// expose its own constant, so this is kept in sync by hand. `serialize_num`
+/// persists a `Num` via `Display`, which rounds to this many decimals; a
+/// value must still be positive AFTER that rounding to be usable, since a
+/// value that rounds to zero would persist as an unusable zero cost.
+const PERSISTED_DECIMAL_PRECISION: usize = 8;
 
 #[derive(Debug, thiserror::Error)]
 pub enum BotGasCostError {
@@ -261,6 +311,68 @@ impl BotGasReceiptCost {
         }
     }
 
+    /// Compares only the immutable receipt facts, ignoring the derived USD
+    /// valuation (`eth_usd_price*`, `usd_cost`). Two recordings of the same
+    /// transaction are never guaranteed to compute byte-identical valuations:
+    /// `usd_cost`/`eth_usd_price` round-trip lossily through persistence
+    /// (`serialize_num` rounds to `num_decimal::MAX_PRECISION`), and an
+    /// Ethereum receipt's valuation is deliberately pinned to the Base chain
+    /// head at recording time (ADR 0017), which can differ between attempts.
+    /// A repeated `Record` for the same receipt is idempotent as long as the
+    /// facts that came from the receipt itself still agree.
+    /// Compares every field EXCEPT the valuation-derived ones (`eth_usd_price`
+    /// and everything sourced from it: `eth_usd_price_source`,
+    /// `eth_usd_price_at`, `eth_usd_price_block_number`, `usd_cost`), which a
+    /// retry can legitimately recompute differently (see `handle`'s
+    /// idempotency comment). Destructured field-by-field (rather than a
+    /// hand-listed `&&` chain) so a newly added struct field fails to compile
+    /// here until explicitly classified as immutable-and-compared or
+    /// valuation-derived-and-ignored.
+    fn matches_immutable_receipt_facts(&self, other: &Self) -> bool {
+        let Self {
+            chain,
+            tx_hash,
+            receipt_from,
+            gas_used,
+            effective_gas_price_wei,
+            native_cost_wei,
+            eth_usd_price: _,
+            eth_usd_price_source: _,
+            eth_usd_price_at: _,
+            eth_usd_price_block_number: _,
+            usd_cost: _,
+            operation_category,
+            symbol,
+            occurred_at,
+        } = self;
+        let Self {
+            chain: other_chain,
+            tx_hash: other_tx_hash,
+            receipt_from: other_receipt_from,
+            gas_used: other_gas_used,
+            effective_gas_price_wei: other_effective_gas_price_wei,
+            native_cost_wei: other_native_cost_wei,
+            eth_usd_price: _,
+            eth_usd_price_source: _,
+            eth_usd_price_at: _,
+            eth_usd_price_block_number: _,
+            usd_cost: _,
+            operation_category: other_operation_category,
+            symbol: other_symbol,
+            occurred_at: other_occurred_at,
+        } = other;
+
+        chain == other_chain
+            && tx_hash == other_tx_hash
+            && receipt_from == other_receipt_from
+            && gas_used == other_gas_used
+            && effective_gas_price_wei == other_effective_gas_price_wei
+            && native_cost_wei == other_native_cost_wei
+            && operation_category == other_operation_category
+            && symbol == other_symbol
+            && occurred_at == other_occurred_at
+    }
+
     pub(crate) fn validate(&self) -> Result<(), BotGasReceiptCostError> {
         if self.gas_used == 0 {
             return Err(BotGasReceiptCostError::ZeroGasUsed);
@@ -274,7 +386,16 @@ impl BotGasReceiptCost {
         if !self.eth_usd_price.is_positive() {
             return Err(BotGasReceiptCostError::NonPositiveEthUsdPrice);
         }
-        if !self.usd_cost.is_positive() {
+        // Validated against the value as it will actually be PERSISTED
+        // (rounded to `PERSISTED_DECIMAL_PRECISION`), not the full-precision
+        // value computed here: a sufficiently small positive cost can round
+        // down to exactly zero once persisted even though it is positive at
+        // full precision, which would silently write an unusable zero cost.
+        if !self
+            .usd_cost
+            .round_with(PERSISTED_DECIMAL_PRECISION)
+            .is_positive()
+        {
             return Err(BotGasReceiptCostError::NonPositiveUsdCost);
         }
 
@@ -345,7 +466,20 @@ impl EventSourced for BotGasReceiptCost {
         _services: &Self::Services,
     ) -> Result<Vec<Self::Event>, Self::Error> {
         match command {
-            BotGasReceiptCostCommand::Record { cost } if self == &cost => Ok(Vec::new()),
+            BotGasReceiptCostCommand::Record { cost }
+                if self.matches_immutable_receipt_facts(&cost) =>
+            {
+                if self != &cost {
+                    info!(
+                        chain = %cost.chain,
+                        tx_hash = %cost.tx_hash,
+                        "repeated bot gas receipt cost record for the same transaction; \
+                         immutable receipt facts match, treating as a no-op despite a \
+                         differing USD valuation"
+                    );
+                }
+                Ok(Vec::new())
+            }
             BotGasReceiptCostCommand::Record { .. } => {
                 Err(BotGasReceiptCostError::ConflictingReceiptCost)
             }
@@ -382,9 +516,8 @@ fn parse_num(field: &'static str, value: &str) -> Result<Num, BotGasCostError> {
 
 fn native_cost_usd(native_cost_wei: U256, eth_usd_price: &Num) -> Result<Num, BotGasCostError> {
     let native_cost_wei = parse_num("native_cost_wei", &native_cost_wei.to_string())?;
-    let wei_per_eth = parse_num("wei_per_eth", WEI_PER_ETH)?;
 
-    Ok(&(&native_cost_wei / &wei_per_eth) * eth_usd_price)
+    Ok(&(&native_cost_wei / &*WEI_PER_ETH) * eth_usd_price)
 }
 
 #[cfg(test)]
@@ -542,6 +675,77 @@ mod tests {
         }
     }
 
+    /// A `usd_cost` that is positive at full precision but rounds down to
+    /// exactly zero once persisted (`serialize_num` rounds to
+    /// `PERSISTED_DECIMAL_PRECISION` decimals) must be rejected at record
+    /// time, not silently written as an unusable zero cost.
+    #[test]
+    fn receipt_cost_rejects_usd_cost_that_rounds_to_zero_once_persisted() {
+        let bot = Address::repeat_byte(0x01);
+        let mut dust_receipt = receipt(bot);
+        dust_receipt.gas_used = 1;
+        dust_receipt.effective_gas_price = 1;
+        let mut dust_price = price();
+        // native_cost_wei = 1, so usd_cost = 1e-18 * dust_price -- far below
+        // PERSISTED_DECIMAL_PRECISION (8 decimals) but still strictly positive.
+        dust_price.price = Num::from_str("0.000001").unwrap();
+
+        let cost = BotGasReceiptCost::from_receipt(
+            &dust_receipt,
+            bot,
+            BotGasChain::Base,
+            BotGasOperationCategory::VaultDeposit,
+            None,
+            dust_price,
+            Utc.with_ymd_and_hms(2026, 7, 16, 12, 0, 1).unwrap(),
+        );
+
+        let error = cost.expect_err(
+            "a usd_cost that rounds to zero once persisted must be rejected at record time",
+        );
+        assert!(
+            matches!(
+                error,
+                BotGasCostError::InvalidReceiptCost(BotGasReceiptCostError::NonPositiveUsdCost)
+            ),
+            "expected NonPositiveUsdCost, got: {error:?}"
+        );
+    }
+
+    /// `validate()` guards against a `usd_cost` that persists as zero by
+    /// calling `round_with(PERSISTED_DECIMAL_PRECISION)`, a hand-copied
+    /// mirror of `num_decimal::Num`'s private `MAX_PRECISION` (the crate
+    /// does not expose it). The actual persisted value instead goes through
+    /// `serialize_num`'s `value.to_string()` (`Num`'s `Display`, which
+    /// internally rounds via the same `round_with` at its own `MAX_PRECISION`).
+    /// This binds the two: for values straddling the 8-decimal boundary,
+    /// `round_with(PERSISTED_DECIMAL_PRECISION)` must agree with the actual
+    /// serialize-then-reparse round-trip, so a future `num-decimal` version
+    /// bump that changes `MAX_PRECISION` fails this test loudly instead of
+    /// silently letting `validate()` and persistence disagree.
+    #[test]
+    fn persisted_decimal_precision_matches_actual_serialization_rounding() {
+        for value in [
+            "0.000000004999999995",
+            "0.000000005000000005",
+            "0.000000001",
+            "0.0000000049",
+            "123.123456785",
+        ] {
+            let num = Num::from_str(value).unwrap();
+
+            let rounded_via_validate = num.round_with(PERSISTED_DECIMAL_PRECISION);
+            let round_tripped_via_persistence = Num::from_str(&num.to_string()).unwrap();
+
+            assert_eq!(
+                rounded_via_validate, round_tripped_via_persistence,
+                "PERSISTED_DECIMAL_PRECISION ({PERSISTED_DECIMAL_PRECISION}) has drifted from \
+                 num_decimal::Num's actual Display/serialization precision for input {value} -- \
+                 validate()'s zero-cost guard no longer matches what gets persisted"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn identical_receipt_cost_retry_is_idempotent() {
         let bot = Address::repeat_byte(0x01);
@@ -578,8 +782,11 @@ mod tests {
             Utc.with_ymd_and_hms(2026, 7, 16, 12, 0, 1).unwrap(),
         )
         .unwrap();
+        // Differs in an immutable receipt fact (gas_used), not just the
+        // derived USD valuation -- a genuine conflicting fact for the same
+        // (chain, tx_hash), which the aggregate must still reject.
         let mut conflicting = cost.clone();
-        conflicting.eth_usd_price = Num::from_str("2100").unwrap();
+        conflicting.gas_used = cost.gas_used + 1;
 
         let error = TestHarness::<BotGasReceiptCost>::with(())
             .given(vec![BotGasReceiptCostEvent::Recorded { cost }])
@@ -591,6 +798,57 @@ mod tests {
             error,
             LifecycleError::Apply(BotGasReceiptCostError::ConflictingReceiptCost)
         ));
+    }
+
+    /// Reproduces the real production idempotency scenario described on
+    /// `matches_immutable_receipt_facts`: a retried job's full-precision
+    /// valuation disagreeing with the persisted, rounded one must still be
+    /// treated as the same fact. Realistic gas/price inputs (not the
+    /// contrived clean numbers used elsewhere in this module) produce a
+    /// value with more than 8 decimal places, so this exercises the actual
+    /// lossy round-trip rather than an input that happens to survive it
+    /// unchanged.
+    #[tokio::test]
+    async fn identical_retry_is_idempotent_despite_lossy_usd_valuation_roundtrip() {
+        let bot = Address::repeat_byte(0x01);
+        let mut realistic_receipt = receipt(bot);
+        realistic_receipt.gas_used = 150_000;
+        realistic_receipt.effective_gas_price = 5_000_257;
+        let realistic_price = EthUsdPrice {
+            price: Num::from_str("2000.12345678").unwrap(),
+            source: "eth_usd_valuation_feed".to_owned(),
+            observed_at: Utc.with_ymd_and_hms(2026, 7, 16, 12, 0, 0).unwrap(),
+            block_number: Some(123),
+        };
+
+        let freshly_computed = BotGasReceiptCost::from_receipt(
+            &realistic_receipt,
+            bot,
+            BotGasChain::Base,
+            BotGasOperationCategory::VaultDeposit,
+            None,
+            realistic_price,
+            Utc.with_ymd_and_hms(2026, 7, 16, 12, 0, 1).unwrap(),
+        )
+        .unwrap();
+
+        // Simulate persistence's lossy round-trip through `serialize_num`.
+        let rehydrated_usd_cost = Num::from_str(&freshly_computed.usd_cost.to_string()).unwrap();
+        assert_ne!(
+            rehydrated_usd_cost, freshly_computed.usd_cost,
+            "test fixture must exercise the lossy round-trip; adjust the gas/price inputs \
+             if this assertion starts failing"
+        );
+        let mut rehydrated = freshly_computed.clone();
+        rehydrated.usd_cost = rehydrated_usd_cost;
+
+        TestHarness::<BotGasReceiptCost>::with(())
+            .given(vec![BotGasReceiptCostEvent::Recorded { cost: rehydrated }])
+            .when(BotGasReceiptCostCommand::Record {
+                cost: freshly_computed,
+            })
+            .await
+            .then_expect_events(&[]);
     }
 
     #[tokio::test]
