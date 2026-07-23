@@ -45,7 +45,7 @@ use super::{
     },
 };
 use crate::bindings::TestERC20;
-use crate::conductor::job::Job;
+use crate::conductor::job::{BackpressureStreak, Job};
 use crate::equity_redemption::{
     EquityRedemption, EquityRedemptionCommand, redemption_aggregate_id,
 };
@@ -2682,6 +2682,7 @@ async fn wrapped_recovery_reschedules_when_held_for_recovery_but_no_balance() {
     let job = WrappedEquityRecoveryJob {
         symbol: symbol.clone(),
         recovery_id: recovery_id.clone(),
+        backpressure_streak: BackpressureStreak::default(),
     };
 
     // The job claims HeldForRecovery, finds no wrapped balance, and reschedules
@@ -2813,6 +2814,7 @@ async fn recovery_job_breaks_deadlock_when_wrap_landed_wrapped_equity_recovery()
     let job = WrappedEquityRecoveryJob {
         symbol: symbol.clone(),
         recovery_id: recovery_id.clone(),
+        backpressure_streak: BackpressureStreak::default(),
     };
 
     // The job must claim HeldForRecovery and run to completion.
@@ -2951,6 +2953,7 @@ async fn recovery_job_breaks_deadlock_when_wrap_failed_unwrapped_equity_recovery
     let job = UnwrappedEquityRecoveryJob {
         symbol: symbol.clone(),
         recovery_id: recovery_id.clone(),
+        backpressure_streak: BackpressureStreak::default(),
     };
 
     // The job must claim HeldForRecovery and run to completion.
@@ -3102,6 +3105,7 @@ async fn recovery_job_breaks_deadlock_when_wrap_failed_dispatches_active_mint() 
     let job = UnwrappedEquityRecoveryJob {
         symbol: symbol.clone(),
         recovery_id: recovery_id.clone(),
+        backpressure_streak: BackpressureStreak::default(),
     };
 
     // The job must claim HeldForRecovery and dispatch through the ActiveMint path.

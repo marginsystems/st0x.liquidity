@@ -12,7 +12,7 @@ use rain_math_float::Float;
 use serde::{Deserialize, Serialize};
 use st0x_float_macro::float;
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use st0x_config::{AssetsConfig, ExecutionThreshold};
 use st0x_event_sorcery::{AggregateError, LifecycleError, Store};
@@ -20,7 +20,10 @@ use st0x_execution::{
     Direction, FractionalShares, MarketSession, Positive, SupportedExecutor, Symbol, Usd,
 };
 
-use crate::conductor::job::{Job, JobQueue, Label};
+use crate::conductor::job::{
+    BACKPRESSURE_RESCHEDULE_LIMIT, BackpressureOutcome, BackpressureStreak, Job, JobQueue, Label,
+    advance_backpressure, apply_backpressure_step, find_backpressure,
+};
 #[cfg(test)]
 use crate::offchain::order::PollOrderStatus;
 use crate::offchain::order::{
@@ -103,6 +106,11 @@ pub(crate) struct HedgeCtx {
     /// `OffchainOrder::Place` handler.
     pub(crate) order_placer: Arc<dyn OrderPlacer>,
     pub(crate) poll_status_queue: PollOrderStatusJobQueue,
+    /// This job's own queue, so a classified broker rate-limit (429) can
+    /// reschedule itself (RAI-1494) instead of consuming the terminal retry
+    /// budget. Previously missing -- `HedgeCtx` held `poll_status_queue` for
+    /// `recover_pending_poll_status` but no handle to its own job type.
+    pub(crate) hedge_queue: HedgeJobQueue,
     /// Per-symbol asset config. Gates the extended-hours limit path: only a
     /// symbol with `extended_hours_counter_trading = enabled` may place a limit
     /// order during an Extended session. A disabled symbol skips (the
@@ -147,6 +155,27 @@ pub(crate) struct PlaceHedge {
     /// live session before selecting the broker order kind.
     #[serde(default = "default_market_session")]
     pub(crate) market_session: MarketSession,
+    /// Count of consecutive broker rate-limit (429) reschedules leading up to
+    /// this attempt (RAI-1494). `#[serde(default)]` so a row enqueued under
+    /// the pre-this-change payload shape still deserializes to `0` instead of
+    /// crashing the poll stream's `sqlx::Decode`.
+    ///
+    /// This job is "reschedule-then-backstop", not "true retry": the position
+    /// claim (`PositionCommand::PlaceOffChainOrder`) commits before the
+    /// broker call, so once that guard commits, a 429 later in the same
+    /// attempt reschedules, but the pushed successor hits
+    /// `PositionError::PendingExecution` and calls
+    /// `recover_pending_poll_status` instead of re-placing the order --
+    /// completion is delegated to `PollOrderStatus`'s existing poll-status
+    /// recovery. This "caps at 1" property holds only for a 429 raised AFTER
+    /// the claim commits. A 429 raised BEFORE the claim -- e.g. during
+    /// `select_order_kind_for_current_session`'s extended-hours price lookup
+    /// -- has no committed guard yet, so the successor genuinely re-attempts
+    /// that step (see `handle_place_hedge_error`'s doc) and the streak can
+    /// climb all the way to `BACKPRESSURE_RESCHEDULE_LIMIT` before
+    /// dead-lettering, same as any true-retry job.
+    #[serde(default)]
+    pub(crate) backpressure_streak: BackpressureStreak,
 }
 
 fn default_market_session() -> MarketSession {
@@ -440,6 +469,15 @@ impl Job<HedgeCtx> for PlaceHedge {
     }
 
     async fn perform(&self, ctx: &HedgeCtx) -> Result<Self::Output, Self::Error> {
+        match self.perform_body(ctx).await {
+            Ok(output) => Ok(output),
+            Err(error) => self.handle_place_hedge_error(ctx, error).await,
+        }
+    }
+}
+
+impl PlaceHedge {
+    async fn perform_body(&self, ctx: &HedgeCtx) -> Result<(), TradeAccountingError> {
         // Residual TOCTOU: the session read, the limit-price fetch, and the
         // broker submission are three separate awaits, so the venue clock can
         // cross a 9:30/16:00 boundary between them. This is inherent (the clock
@@ -570,6 +608,80 @@ impl Job<HedgeCtx> for PlaceHedge {
         .await?;
 
         route_placement_outcome(ctx, &self.symbol, self.offchain_order_id, placed).await
+    }
+
+    /// Handles a `perform_body` failure: reschedules with a classified delay
+    /// on broker rate-limiting (429) instead of consuming the terminal retry
+    /// budget, or propagates any other error through the normal, unmodified
+    /// retry/circuit-breaker path.
+    ///
+    /// `PositionCommand::PlaceOffChainOrder` claims the position before the
+    /// broker call, so a rescheduled successor short-circuits to
+    /// `PositionError::PendingExecution` -> `recover_pending_poll_status`
+    /// rather than re-driving the broker call -- this job is
+    /// "reschedule-then-backstop", not "true retry" (see the RAI-1494 plan's
+    /// per-job classification table). A 429 before the claim commits (e.g.
+    /// during `select_order_kind_for_current_session`'s extended-hours price
+    /// lookup) is likewise safe to reschedule: the claim has not happened
+    /// yet, so the successor genuinely re-attempts that step.
+    async fn handle_place_hedge_error(
+        &self,
+        ctx: &HedgeCtx,
+        error: TradeAccountingError,
+    ) -> Result<(), TradeAccountingError> {
+        let Some(backpressure) = find_backpressure(&error) else {
+            return Err(error);
+        };
+
+        let step = advance_backpressure(&backpressure, self.backpressure_streak);
+        let mut queue = ctx.hedge_queue.clone();
+        let outcome = apply_backpressure_step(step, &mut queue, |next_streak| Self {
+            symbol: self.symbol.clone(),
+            direction: self.direction,
+            shares: self.shares,
+            executor: self.executor,
+            threshold: self.threshold,
+            offchain_order_id: self.offchain_order_id,
+            market_session: self.market_session,
+            backpressure_streak: next_streak,
+        })
+        .await?;
+
+        match outcome {
+            BackpressureOutcome::DeadLettered => {
+                // Per the RAI-1494 plan's binding M2 decision (applied uniformly
+                // to every supervised job): dead-letter instead of propagating
+                // `Err` into the shared supervised on-event path.
+                let BackpressureStreak(streak) = self.backpressure_streak;
+                error!(
+                    target: "hedge",
+                    symbol = %self.symbol,
+                    offchain_order_id = %self.offchain_order_id,
+                    streak,
+                    limit = BACKPRESSURE_RESCHEDULE_LIMIT,
+                    "PlaceHedge: broker rate-limiting exceeded the reschedule budget; \
+                     dead-lettering this hedge instead of opening the circuit breaker \
+                     -- treat as a structurally-dead Alpaca integration needing manual \
+                     reconciliation"
+                );
+            }
+            BackpressureOutcome::Rescheduled {
+                next_streak: BackpressureStreak(streak),
+                visible,
+            } => {
+                if visible {
+                    error!(
+                        target: "hedge",
+                        symbol = %self.symbol,
+                        offchain_order_id = %self.offchain_order_id,
+                        streak,
+                        "PlaceHedge: still rescheduling after sustained broker rate-limiting"
+                    );
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -736,6 +848,7 @@ mod tests {
             position: position.clone(),
             offchain_order,
             poll_status_queue: PollOrderStatusJobQueue::new(&apalis_pool),
+            hedge_queue: HedgeJobQueue::new(&apalis_pool),
             // The placer doubles as the session source; the default stubs
             // report a Regular session, so these ctxs exercise the regular
             // market-order path. AAPL is enabled for extended hours so the
@@ -790,6 +903,7 @@ mod tests {
             threshold: ExecutionThreshold::whole_share(),
             offchain_order_id: OffchainOrderId::new(),
             market_session: MarketSession::Regular,
+            backpressure_streak: BackpressureStreak::default(),
         }
     }
 
@@ -812,6 +926,238 @@ mod tests {
             job.market_session,
             MarketSession::Regular,
             "legacy PlaceHedge jobs without market_session must deserialize as Regular"
+        );
+    }
+
+    #[test]
+    fn place_hedge_payload_without_backpressure_streak_deserializes_to_zero() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let offchain_order_id = OffchainOrderId::new();
+        let payload = serde_json::json!({
+            "symbol": symbol,
+            "direction": Direction::Sell,
+            "shares": Positive::new(FractionalShares::new(float!(2.0))).unwrap(),
+            "executor": SupportedExecutor::DryRun,
+            "threshold": ExecutionThreshold::whole_share(),
+            "offchain_order_id": offchain_order_id,
+            "market_session": MarketSession::Regular,
+        });
+
+        let job: PlaceHedge = serde_json::from_value(payload).unwrap();
+
+        assert_eq!(job.backpressure_streak, BackpressureStreak::default());
+    }
+
+    fn place_hedge_job_type() -> &'static str {
+        std::any::type_name::<PlaceHedge>()
+    }
+
+    async fn successor_backpressure_streak(apalis_pool: &apalis_sqlite::SqlitePool) -> i64 {
+        sqlx_apalis::query_scalar(
+            "SELECT json_extract(CAST(job AS TEXT), '$.backpressure_streak') FROM Jobs \
+             WHERE job_type = ?",
+        )
+        .bind(place_hedge_job_type())
+        .fetch_one(apalis_pool)
+        .await
+        .unwrap()
+    }
+
+    fn alpaca_429(retry_after_millis: u64) -> TradeAccountingError {
+        TradeAccountingError::AlpacaBrokerApi(st0x_execution::AlpacaBrokerApiError::ApiError {
+            status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+            alpaca_code: None,
+            message: "rate limited".to_string(),
+            retry_after: Some(Duration::from_millis(retry_after_millis)),
+        })
+    }
+
+    /// `handle_place_hedge_error` is the actual new RAI-1494 mechanism this
+    /// job gained; `PositionCommand::PlaceOffChainOrder`'s claim guard (the
+    /// reason this job is "reschedule-then-backstop", not "true retry") is
+    /// pre-existing and already idempotent under the existing `retries(3)`
+    /// path, so it is exercised at the unit level here rather than re-proven
+    /// end to end.
+    #[tokio::test]
+    async fn place_hedge_429_reschedules_with_incremented_streak_and_does_not_propagate_err() {
+        let TestInfra {
+            ctx, apalis_pool, ..
+        } = create_hedge_ctx(succeeding_order_placer()).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let job = hedge_job(&symbol, 2.0, Direction::Sell);
+
+        job.handle_place_hedge_error(&ctx, alpaca_429(1))
+            .await
+            .unwrap();
+
+        assert_eq!(successor_backpressure_streak(&apalis_pool).await, 1);
+    }
+
+    #[tokio::test]
+    async fn place_hedge_429_past_reschedule_limit_dead_letters_without_propagating_err() {
+        let TestInfra {
+            ctx, apalis_pool, ..
+        } = create_hedge_ctx(succeeding_order_placer()).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let mut job = hedge_job(&symbol, 2.0, Direction::Sell);
+        job.backpressure_streak = BackpressureStreak(BACKPRESSURE_RESCHEDULE_LIMIT);
+
+        job.handle_place_hedge_error(&ctx, alpaca_429(1))
+            .await
+            .unwrap();
+
+        let job_count: i64 =
+            sqlx_apalis::query_scalar("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
+                .bind(place_hedge_job_type())
+                .fetch_one(&apalis_pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            job_count, 0,
+            "an exhausted backpressure streak must dead-letter, not reschedule"
+        );
+    }
+
+    #[tokio::test]
+    async fn place_hedge_non_backpressure_error_propagates_unchanged() {
+        let TestInfra { ctx, .. } = create_hedge_ctx(succeeding_order_placer()).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let job = hedge_job(&symbol, 2.0, Direction::Sell);
+        let error =
+            TradeAccountingError::AlpacaBrokerApi(st0x_execution::AlpacaBrokerApiError::ApiError {
+                status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                alpaca_code: None,
+                message: "boom".to_string(),
+                retry_after: None,
+            });
+
+        let result = job.handle_place_hedge_error(&ctx, error).await;
+        let Err(TradeAccountingError::AlpacaBrokerApi(
+            st0x_execution::AlpacaBrokerApiError::ApiError { status, .. },
+        )) = result
+        else {
+            panic!("expected the non-backpressure error to propagate unchanged");
+        };
+        assert_eq!(status, reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// `OrderPlacer` whose extended-hours price lookup fails with a classified
+    /// broker rate-limit (429) wrapped exactly as the real Alpaca executor
+    /// produces it: `AlpacaBrokerApiError::LatestTrade(AlpacaMarketDataError)`,
+    /// a two-hop boxed source (`TradeAccountingError::LimitPriceFetch` boxes
+    /// a `dyn Error`, which itself wraps the market-data error). Used to pin
+    /// the extended-hours reschedule path `handle_place_hedge_error`'s doc
+    /// comment claims handles (RAI-1494).
+    fn rate_limited_price_fetch_placer() -> Arc<dyn OrderPlacer> {
+        struct RateLimitedPricePlacer;
+
+        #[async_trait::async_trait]
+        impl OrderPlacer for RateLimitedPricePlacer {
+            async fn place_market_order(
+                &self,
+                _order: st0x_execution::MarketOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Err(
+                    "place_market_order must not be called when the price fetch is rate-limited"
+                        .into(),
+                )
+            }
+
+            async fn place_limit_order(
+                &self,
+                _order: st0x_execution::LimitOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Err(
+                    "place_limit_order must not be called when the price fetch is rate-limited"
+                        .into(),
+                )
+            }
+
+            async fn cancel_order(
+                &self,
+                _executor_order_id: &st0x_execution::ExecutorOrderId,
+            ) -> Result<st0x_execution::CancellationOutcome, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(st0x_execution::CancellationOutcome::Requested)
+            }
+
+            async fn fetch_latest_trade_price(
+                &self,
+                _symbol: &Symbol,
+            ) -> Result<
+                Option<st0x_execution::Positive<Usd>>,
+                Box<dyn std::error::Error + Send + Sync>,
+            > {
+                Err(Box::new(st0x_execution::AlpacaBrokerApiError::LatestTrade(
+                    st0x_execution::AlpacaMarketDataError::ApiError {
+                        status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+                        body: "rate limited".to_string(),
+                        retry_after: Some(Duration::from_millis(1)),
+                    },
+                )))
+            }
+
+            async fn market_session(
+                &self,
+            ) -> Result<MarketSession, Box<dyn std::error::Error + Send + Sync>> {
+                Ok(MarketSession::Extended)
+            }
+        }
+
+        Arc::new(RateLimitedPricePlacer)
+    }
+
+    #[tokio::test]
+    async fn place_hedge_extended_hours_price_fetch_429_reschedules_through_perform_without_claiming_position()
+     {
+        let TestInfra {
+            ctx,
+            apalis_pool,
+            position_projection,
+            ..
+        } = create_hedge_ctx_with(
+            rate_limited_price_fetch_placer(),
+            extended_hours_assets("AAPL", true),
+        )
+        .await;
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        fill_position(
+            &ctx.position,
+            &symbol,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        let job = PlaceHedge {
+            symbol: symbol.clone(),
+            direction: Direction::Sell,
+            shares: Positive::new(FractionalShares::new(float!(2.0))).unwrap(),
+            executor: SupportedExecutor::DryRun,
+            threshold: ExecutionThreshold::whole_share(),
+            offchain_order_id: OffchainOrderId::new(),
+            market_session: MarketSession::Extended,
+            backpressure_streak: BackpressureStreak::default(),
+        };
+
+        // Driven through the REAL `Job::perform` entry point (not
+        // `handle_place_hedge_error` called directly): the two-hop boxed 429
+        // must reschedule (`Ok(())`), not propagate as `Err`.
+        job.perform(&ctx).await.unwrap();
+
+        assert_eq!(successor_backpressure_streak(&apalis_pool).await, 1);
+
+        let position = position_projection
+            .load(&symbol)
+            .await
+            .unwrap()
+            .expect("position should exist");
+        assert_eq!(
+            position.pending_offchain_order_id, None,
+            "a 429 raised before the position claim must not claim the position"
         );
     }
 
@@ -1265,6 +1611,7 @@ mod tests {
             position: position.clone(),
             offchain_order,
             poll_status_queue: PollOrderStatusJobQueue::new(&apalis_pool),
+            hedge_queue: HedgeJobQueue::new(&apalis_pool),
             order_placer: placer,
             assets: extended_hours_assets("AAPL", true),
             counter_trade_slippage_bps: 100,
@@ -1458,6 +1805,7 @@ mod tests {
             threshold: ExecutionThreshold::whole_share(),
             offchain_order_id: OffchainOrderId::new(),
             market_session: MarketSession::Extended,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         job.perform(&ctx).await.unwrap();
@@ -1530,6 +1878,7 @@ mod tests {
             offchain_order_id: OffchainOrderId::new(),
             // Stale: enqueued during regular hours, retried during Extended.
             market_session: MarketSession::Regular,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         job.perform(&ctx)
@@ -1593,6 +1942,7 @@ mod tests {
             offchain_order_id: OffchainOrderId::new(),
             // Stale serialized session: enqueued during regular hours.
             market_session: MarketSession::Regular,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         job.perform(&ctx)
@@ -1707,6 +2057,7 @@ mod tests {
             threshold: ExecutionThreshold::whole_share(),
             offchain_order_id: OffchainOrderId::new(),
             market_session: MarketSession::Extended,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         // The job fails with a retryable error (it propagates, so apalis
@@ -1847,6 +2198,7 @@ mod tests {
             threshold: ExecutionThreshold::whole_share(),
             offchain_order_id: OffchainOrderId::new(),
             market_session: MarketSession::Extended,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         job.perform(&ctx)
@@ -1893,6 +2245,7 @@ mod tests {
             threshold: ExecutionThreshold::whole_share(),
             offchain_order_id: OffchainOrderId::new(),
             market_session: MarketSession::Extended,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         job.perform(&ctx).await.unwrap();
@@ -2008,6 +2361,7 @@ mod tests {
             position: position.clone(),
             offchain_order,
             poll_status_queue: PollOrderStatusJobQueue::new(&apalis_pool),
+            hedge_queue: HedgeJobQueue::new(&apalis_pool),
             order_placer: placer,
             assets,
             counter_trade_slippage_bps: 100,

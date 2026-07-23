@@ -26,6 +26,7 @@ use st0x_tokenization::{
 };
 use st0x_wrapper::{Wrapper, WrapperService};
 
+use super::backpressure_retry::{BACKPRESSURE_RETRY_MAX_ATTEMPTS, retry_on_backpressure};
 use super::{TransferDirection, TransferType};
 use crate::api::ResumeResponse;
 use crate::equity_redemption::{
@@ -509,16 +510,26 @@ async fn run_usdc_transfer<Writer: Write>(
     // re-enters from the persisted state on the same id -- so this single
     // invocation covers both the first run and every redrive without ever
     // minting a second `UsdcRebalanceId` against the already-burned funds.
-    redrive_transfer_until_settled(CLI_ATTESTATION_REDRIVE_DELAY, || async {
-        match direction {
-            TransferDirection::ToRaindex => {
-                rebalance_manager.resume_alpaca_to_base(&id, amount).await
-            }
-            TransferDirection::ToAlpaca => {
-                rebalance_manager.resume_base_to_alpaca(&id, amount).await
-            }
-        }
-    })
+    // Bounded in-call retry (RAI-1494): a classified broker rate-limit (429)
+    // retries the whole redrive-until-settled attempt (bounded), rather than
+    // surfacing immediately as a CLI failure. Re-invoking `resume_*` on the
+    // same `id` is exactly as safe as `redrive_transfer_until_settled`'s own
+    // existing redrives -- both re-enter the same persisted aggregate state.
+    retry_on_backpressure(
+        || {
+            redrive_transfer_until_settled(CLI_ATTESTATION_REDRIVE_DELAY, || async {
+                match direction {
+                    TransferDirection::ToRaindex => {
+                        rebalance_manager.resume_alpaca_to_base(&id, amount).await
+                    }
+                    TransferDirection::ToAlpaca => {
+                        rebalance_manager.resume_base_to_alpaca(&id, amount).await
+                    }
+                }
+            })
+        },
+        BACKPRESSURE_RETRY_MAX_ATTEMPTS,
+    )
     .await?;
 
     let completion = match direction {
@@ -1039,15 +1050,24 @@ pub(super) async fn alpaca_tokenize_command<Writer: Write, Prov: Provider + Clon
 
     writeln!(stdout, "   Sending mint request to Alpaca...")?;
 
+    // Bounded in-call retry (RAI-1494): a classified broker rate-limit (429)
+    // retries in place instead of failing this CLI command immediately. The
+    // `issuer_request_id` is generated once, outside the retry closure, and
+    // reused across placement retries so a redelivered 429 cannot mint
+    // against a second issuer-side idempotency key.
     let issuer_request_id = IssuerRequestId::generate();
-    let request = tokenization_service
-        .request_mint(
-            symbol.clone(),
-            quantity,
-            receiving_wallet,
-            issuer_request_id,
-        )
-        .await?;
+    let request = retry_on_backpressure(
+        || {
+            tokenization_service.request_mint(
+                symbol.clone(),
+                quantity,
+                receiving_wallet,
+                issuer_request_id.clone(),
+            )
+        },
+        BACKPRESSURE_RETRY_MAX_ATTEMPTS,
+    )
+    .await?;
 
     writeln!(stdout, "   Request ID: {}", request.id)?;
     writeln!(stdout, "   Status: {:?}", request.status)?;
@@ -1055,9 +1075,11 @@ pub(super) async fn alpaca_tokenize_command<Writer: Write, Prov: Provider + Clon
     if request.status == TokenizationRequestStatus::Pending {
         writeln!(stdout, "   Polling Alpaca until completion...")?;
 
-        let completed = tokenization_service
-            .poll_mint_until_complete(&request.id)
-            .await?;
+        let completed = retry_on_backpressure(
+            || tokenization_service.poll_mint_until_complete(&request.id),
+            BACKPRESSURE_RETRY_MAX_ATTEMPTS,
+        )
+        .await?;
 
         writeln!(stdout, "   Alpaca status: {:?}", completed.status)?;
 
@@ -1157,12 +1179,23 @@ pub(super) async fn alpaca_redeem_command<Writer: Write>(
 
     writeln!(stdout, "   Sending tokens to redemption wallet...")?;
 
+    // `send_for_redemption` is a raw ERC20 transfer with no issuer-side
+    // idempotency key (unlike `request_mint`'s `IssuerRequestId`), and its
+    // error path never crosses the Alpaca API, so it cannot classify as
+    // broker rate-limiting -- retrying it here would risk a double on-chain
+    // send for no possible backpressure benefit. Left unwrapped
+    // intentionally (RAI-1494); only the two Alpaca API polls below are
+    // bounded-retried.
     let tx_hash = Tokenizer::send_for_redemption(&tokenization_service, token, amount).await?;
 
     writeln!(stdout, "   Transfer tx: {tx_hash}")?;
     writeln!(stdout, "   Waiting for Alpaca to detect transfer...")?;
 
-    let request = Tokenizer::poll_for_redemption(&tokenization_service, &tx_hash).await?;
+    let request = retry_on_backpressure(
+        || Tokenizer::poll_for_redemption(&tokenization_service, &tx_hash),
+        BACKPRESSURE_RETRY_MAX_ATTEMPTS,
+    )
+    .await?;
 
     writeln!(stdout, "   Request ID: {}", request.id)?;
     writeln!(stdout, "   Status: {:?}", request.status)?;
@@ -1170,8 +1203,11 @@ pub(super) async fn alpaca_redeem_command<Writer: Write>(
     if request.status == TokenizationRequestStatus::Pending {
         writeln!(stdout, "   Polling until completion...")?;
 
-        let completed =
-            Tokenizer::poll_redemption_until_complete(&tokenization_service, &request.id).await?;
+        let completed = retry_on_backpressure(
+            || Tokenizer::poll_redemption_until_complete(&tokenization_service, &request.id),
+            BACKPRESSURE_RETRY_MAX_ATTEMPTS,
+        )
+        .await?;
 
         writeln!(stdout, "   Final status: {:?}", completed.status)?;
 
@@ -1650,7 +1686,7 @@ mod tests {
     use st0x_finance::Usdc;
     use st0x_float_macro::float;
     use st0x_tokenization::mock::MockTokenizer;
-    use st0x_tokenization::{issuer_request_id, tokenization_request_id};
+    use st0x_tokenization::{TokenizerError, issuer_request_id, tokenization_request_id};
     use st0x_wrapper::MockWrapper;
 
     use super::*;
@@ -3660,6 +3696,108 @@ mod tests {
                 .contains("equity COIN is not configured in [assets.equities]"),
             "an unconfigured symbol must fail before any network call, got: {error}"
         );
+    }
+
+    /// A classified broker rate-limit (429) on the tokenization mint request
+    /// must be retried in place (RAI-1494), not surfaced on the first
+    /// attempt. Drives a real `httpmock` 429 through `AlpacaTokenizationService`
+    /// exactly as `alpaca_tokenize_command` calls it -- if the
+    /// `retry_on_backpressure` wrapping around `request_mint` were ever
+    /// removed, this test would fail after exactly one call instead of the
+    /// full bounded budget.
+    #[tokio::test]
+    async fn alpaca_tokenize_mint_request_retries_a_429_up_to_the_bounded_budget() {
+        let server = httpmock::MockServer::start_async().await;
+        let account_id = AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"));
+        let mint_path = format!("/v1/accounts/{account_id}/tokenization/mint");
+
+        let mint_mock = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST).path(mint_path);
+                then.status(429)
+                    .header("content-type", "application/json")
+                    .header("Retry-After", "0")
+                    .json_body(serde_json::json!({ "message": "rate limited" }));
+            })
+            .await;
+
+        let tokenization_service = AlpacaTokenizationService::new(
+            server.base_url(),
+            account_id,
+            "test_key".to_string(),
+            "test_secret".to_string(),
+            st0x_evm::StubWallet::stub(Address::ZERO),
+            None,
+        );
+        let issuer_request_id = IssuerRequestId::generate();
+
+        let error = retry_on_backpressure(
+            || {
+                tokenization_service.request_mint(
+                    Symbol::new("AAPL").unwrap(),
+                    FractionalShares::new(float!(10)),
+                    Address::ZERO,
+                    issuer_request_id.clone(),
+                )
+            },
+            BACKPRESSURE_RETRY_MAX_ATTEMPTS,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(error, TokenizerError::Alpaca(_)),
+            "a persistent 429 must still surface as a real failure once the \
+             bounded budget is exhausted, got: {error}"
+        );
+        mint_mock
+            .assert_calls_async(BACKPRESSURE_RETRY_MAX_ATTEMPTS as usize)
+            .await;
+    }
+
+    /// Same regression as the mint case, for the redemption detection poll
+    /// (`alpaca_redeem_command`'s `poll_for_redemption`).
+    #[tokio::test]
+    async fn alpaca_redeem_poll_for_redemption_retries_a_429_up_to_the_bounded_budget() {
+        let server = httpmock::MockServer::start_async().await;
+        let account_id = AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"));
+        let requests_path = format!("/v1/accounts/{account_id}/tokenization/requests");
+
+        let list_mock = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::GET).path(requests_path);
+                then.status(429)
+                    .header("content-type", "application/json")
+                    .header("Retry-After", "0")
+                    .json_body(serde_json::json!({ "message": "rate limited" }));
+            })
+            .await;
+
+        let tokenization_service = AlpacaTokenizationService::new(
+            server.base_url(),
+            account_id,
+            "test_key".to_string(),
+            "test_secret".to_string(),
+            st0x_evm::StubWallet::stub(Address::ZERO),
+            None,
+        );
+        let tx_hash = alloy::primitives::TxHash::ZERO;
+
+        let error = retry_on_backpressure(
+            || Tokenizer::poll_for_redemption(&tokenization_service, &tx_hash),
+            BACKPRESSURE_RETRY_MAX_ATTEMPTS,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(error, TokenizerError::Alpaca(_)),
+            "a persistent 429 must still surface as a real failure once the \
+             bounded budget is exhausted, got: {error}"
+        );
+        list_mock
+            .assert_calls_async(BACKPRESSURE_RETRY_MAX_ATTEMPTS as usize)
+            .await;
     }
 
     fn redemption_services() -> EquityTransferServices {

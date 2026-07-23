@@ -2658,6 +2658,7 @@ mod tests {
             status,
             alpaca_code: None,
             message: message.into(),
+            retry_after: None,
         }
     }
 

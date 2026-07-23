@@ -54,6 +54,7 @@ use st0x_wrapper::WrapperService;
 
 use crate::alerts::{NoopNotifier, NotifierError, TelegramNotifier};
 use crate::conductor::exit::{ConductorExit, MonitorTaskError};
+use crate::conductor::job::BackpressureStreak;
 use crate::conductor::monitor::order_fills::{CutoffProbe, probe_cutoff_block_support};
 use crate::dashboard::Broadcaster;
 use crate::equity_redemption::{
@@ -1910,6 +1911,7 @@ async fn recover_interrupted_tokenization_aggregates(
             resume_queue
                 .push(ResumeTokenizationAggregate {
                     target: ResumeTokenizationTarget::Mint(mint_id.clone()),
+                    backpressure_streak: BackpressureStreak::default(),
                 })
                 .await?;
         }
@@ -1936,6 +1938,7 @@ async fn recover_interrupted_tokenization_aggregates(
             resume_queue
                 .push(ResumeTokenizationAggregate {
                     target: ResumeTokenizationTarget::Redemption(redemption_id.clone()),
+                    backpressure_streak: BackpressureStreak::default(),
                 })
                 .await?;
         }
@@ -2796,6 +2799,7 @@ where
             threshold: cqrs.execution_threshold,
             offchain_order_id,
             market_session: execution.market_session,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         if let Err(error) = cqrs.hedge_queue.clone().push(job).await {
@@ -3866,6 +3870,7 @@ mod tests {
             .push(UnwrappedEquityRecoveryJob {
                 symbol: Symbol::new("AAPL").unwrap(),
                 recovery_id: UnwrappedEquityRecoveryId(uuid::Uuid::new_v4()),
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -4206,6 +4211,8 @@ mod tests {
                 symbol: Symbol::new("AAPL").unwrap(),
                 quantity: FractionalShares::new(float!(1)),
                 generation: 1,
+
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -4216,6 +4223,8 @@ mod tests {
                 aggregate_id: redemption_id,
                 symbol: Symbol::new("AAPL").unwrap(),
                 quantity: FractionalShares::new(float!(1)),
+
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -4283,6 +4292,8 @@ mod tests {
                 symbol: Symbol::new("AAPL").unwrap(),
                 quantity: FractionalShares::new(float!(1)),
                 generation: 1,
+
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -4293,6 +4304,8 @@ mod tests {
                 aggregate_id: redemption_id,
                 symbol: Symbol::new("AAPL").unwrap(),
                 quantity: FractionalShares::new(float!(1)),
+
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -10634,7 +10647,10 @@ mod tests {
         // duplicate.
         cqrs.poll_status_queue
             .clone()
-            .push(PollOrderStatus { offchain_order_id })
+            .push(PollOrderStatus {
+                offchain_order_id,
+                backpressure_streak: BackpressureStreak::default(),
+            })
             .await
             .unwrap();
         assert_eq!(

@@ -3672,6 +3672,53 @@ job's own retry path, and the hedge job's post-placement routing (shared by
 fresh placement and that retry path's `Pending` re-drive) -- so at most one live
 poll job exists per order regardless of which path pushed it.
 
+##### Broker rate-limit (429) backpressure
+
+A `429 Too Many Requests` from Alpaca is not a bug and must not consume a job's
+terminal retry budget or open its circuit breaker. Three call-site shapes, each
+handled differently:
+
+- **Apalis jobs**: on a classified 429, the job's `perform()` catches the error
+  before it ever becomes an `Err`, computes a delay from the broker's
+  `Retry-After` header (or an escalating fallback when absent, floored to a
+  minimum sleep so a `Retry-After: 0` cannot cause a hot loop), pushes a fresh
+  copy of itself back onto its own queue after that delay, and returns `Ok(())`.
+  The row acks `Done` immediately and the worker is free on the very next poll
+  tick to pick up any other pending work -- the row is never held in place
+  waiting out the backoff. A per-job `backpressure_streak` counter travels in
+  the job's own payload (there is no live retry object between separate
+  dispatches) and bounds this to a large but finite reschedule budget; once
+  exhausted, a supervised job (e.g. `Order status
+  poll`) logs loudly and
+  dead-letters cleanly (`Ok(())`, not `Err`) rather than opening its circuit
+  breaker, since a persistent 429 there signals a structurally-dead integration
+  (suspended account, revoked key), not a process fault. `Order status poll`'s
+  `get_order_status` is the one job whose reschedule genuinely re-drives the
+  broker call; other jobs' 429s can land after their own idempotency guard
+  already committed, in which case the reschedule still frees the worker and
+  preserves the retry budget but the guard itself (not the reschedule) is what
+  makes the eventual retry safe.
+  - **Exception -- USDC conversion order placement**: the USD->USDC and
+    USDC->USD conversion placements (inside the USDC hedging/market-making
+    transfer jobs) are NOT rescheduled on a 429, unlike every other call site
+    above. Placement commits the aggregate to `Converting` before the broker
+    call, but a 429 (or any other placement error) still fails fast: the
+    aggregate terminalizes (`ConversionFailed`) and the error propagates as an
+    ordinary terminal failure, exactly as before this backpressure mechanism
+    existed. This is unchanged from prod today, and is a deliberate choice, not
+    an oversight -- retrying a rejected/ambiguous placement risks submitting the
+    order twice against real money. Making conversion placement reschedule-safe
+    needs a place-then-commit reorder of the conversion aggregate (defer
+    recording intent until after a successful placement, or have the resume path
+    re-place idempotently by `client_order_id` instead of only looking the order
+    up) and is a documented follow-up, not part of this mechanism.
+- **Synchronous (CLI) call sites**: no queue row and no sibling job waiting on a
+  shared worker, so a classified 429 is retried in place with a small bounded
+  attempt budget instead.
+- **Supervised, non-job tasks** (e.g. `Executor maintenance`): already correct
+  with no change -- a tick error of any kind, backpressure included, is logged
+  and the loop simply waits for the next tick.
+
 **Lifecycle workflows** (stepped, durable, future):
 
 | Workflow           | Steps                                                                                  |
