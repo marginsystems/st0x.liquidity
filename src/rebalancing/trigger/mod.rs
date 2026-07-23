@@ -32,7 +32,7 @@ use st0x_wrapper::{Wrapper, WrapperError};
 
 use self::freeze::FreezeStatusReader;
 use self::usdc::UsdcRebalanceOperation;
-use crate::conductor::job::QueuePushError;
+use crate::conductor::job::{BackpressureStreak, QueuePushError};
 use crate::equity_redemption::{
     EquityRedemption, EquityRedemptionCommand, EquityRedemptionEvent, RedemptionAggregateId,
 };
@@ -1113,6 +1113,7 @@ impl RebalancingService {
                             id: id.clone(),
                             amount,
                             revert_redrive_attempts: 0,
+                            backpressure_streak: BackpressureStreak::default(),
                         })
                         .await?;
                     self.usdc_in_progress.store(true, Ordering::SeqCst);
@@ -1884,6 +1885,7 @@ impl RebalancingService {
                         .push(WrappedEquityRecoveryJob {
                             symbol: symbol.clone(),
                             recovery_id: recovery_id.clone(),
+                            backpressure_streak: BackpressureStreak::default(),
                         })
                         .await
                     {
@@ -1961,6 +1963,7 @@ impl RebalancingService {
                         .push(UnwrappedEquityRecoveryJob {
                             symbol: symbol.clone(),
                             recovery_id: recovery_id.clone(),
+                            backpressure_streak: BackpressureStreak::default(),
                         })
                         .await
                     {
@@ -3021,6 +3024,7 @@ impl RebalancingService {
                 id: id.clone(),
                 amount,
                 revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await;
 
@@ -3091,6 +3095,7 @@ impl RebalancingService {
                 id: id.clone(),
                 amount,
                 revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await;
 
@@ -3414,6 +3419,7 @@ impl RebalancingService {
                 symbol: symbol.clone(),
                 quantity,
                 generation,
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await;
 
@@ -3510,6 +3516,7 @@ impl RebalancingService {
                 aggregate_id: aggregate_id.clone(),
                 symbol: symbol.clone(),
                 quantity,
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await;
 
@@ -4069,6 +4076,7 @@ impl RebalancingService {
                             id: id.clone(),
                             amount,
                             revert_redrive_attempts: 0,
+                            backpressure_streak: BackpressureStreak::default(),
                         })
                         .await?;
                 }
@@ -4079,6 +4087,7 @@ impl RebalancingService {
                             id: id.clone(),
                             amount,
                             revert_redrive_attempts: 0,
+                            backpressure_streak: BackpressureStreak::default(),
                         })
                         .await?;
                 }
@@ -12521,6 +12530,7 @@ mod tests {
                 id: id.clone(),
                 amount: usdc(400),
                 revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -12651,6 +12661,7 @@ mod tests {
                 id: id.clone(),
                 amount: usdc(400),
                 revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -12685,6 +12696,7 @@ mod tests {
                 id: id.clone(),
                 amount: usdc(400),
                 revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -12714,6 +12726,7 @@ mod tests {
                 id: id.clone(),
                 amount: usdc(400),
                 revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -12764,6 +12777,7 @@ mod tests {
                 id: UsdcRebalanceId(Uuid::new_v4()),
                 amount: usdc(100),
                 revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -12794,6 +12808,7 @@ mod tests {
                 id: UsdcRebalanceId(Uuid::new_v4()),
                 amount: usdc(100),
                 revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -12821,6 +12836,7 @@ mod tests {
                 id: UsdcRebalanceId(Uuid::new_v4()),
                 amount: usdc(100),
                 revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -12857,6 +12873,7 @@ mod tests {
                 id: UsdcRebalanceId(Uuid::new_v4()),
                 amount: usdc(100),
                 revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -12953,6 +12970,7 @@ mod tests {
                 id: id.clone(),
                 amount: usdc(100),
                 revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -13001,6 +13019,7 @@ mod tests {
                 id: id.clone(),
                 amount: usdc(100),
                 revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -13052,6 +13071,7 @@ mod tests {
                 id: id.clone(),
                 amount: usdc(100),
                 revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -13095,6 +13115,7 @@ mod tests {
                 id: UsdcRebalanceId(Uuid::new_v4()),
                 amount: usdc(100),
                 revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -13134,6 +13155,7 @@ mod tests {
                 id: UsdcRebalanceId(Uuid::new_v4()),
                 amount: usdc(100),
                 revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -13177,6 +13199,7 @@ mod tests {
                 id: UsdcRebalanceId(Uuid::new_v4()),
                 amount: usdc(100),
                 revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -13223,6 +13246,7 @@ mod tests {
                     id: zombie_id.clone(),
                     amount: usdc(100),
                     revert_redrive_attempts: 0,
+                    backpressure_streak: BackpressureStreak::default(),
                 })
                 .await
                 .unwrap();
@@ -13266,6 +13290,7 @@ mod tests {
                 id: UsdcRebalanceId(Uuid::new_v4()),
                 amount: usdc(100),
                 revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -13300,6 +13325,7 @@ mod tests {
                 id: UsdcRebalanceId(Uuid::new_v4()),
                 amount: usdc(100),
                 revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -13331,6 +13357,7 @@ mod tests {
                 id: UsdcRebalanceId(Uuid::new_v4()),
                 amount: usdc(100),
                 revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -13372,6 +13399,7 @@ mod tests {
                 id: zombie_id.clone(),
                 amount: usdc(100),
                 revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -13395,6 +13423,7 @@ mod tests {
                 id: live_id.clone(),
                 amount: usdc(100),
                 revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -13436,6 +13465,7 @@ mod tests {
                 id: UsdcRebalanceId(Uuid::new_v4()),
                 amount: usdc(100),
                 revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -13490,6 +13520,7 @@ mod tests {
                 id: id.clone(),
                 amount: usdc(100),
                 revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -13668,6 +13699,8 @@ mod tests {
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
                 generation: 0,
+
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -13706,6 +13739,8 @@ mod tests {
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
                 generation: 0,
+
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -13741,6 +13776,8 @@ mod tests {
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
                 generation: 0,
+
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -13799,6 +13836,8 @@ mod tests {
                 aggregate_id: redemption_id,
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
+
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -13857,6 +13896,8 @@ mod tests {
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
                 generation: 0,
+
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -13911,6 +13952,8 @@ mod tests {
                 aggregate_id: redemption_id,
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
+
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -13965,6 +14008,8 @@ mod tests {
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
                 generation: 0,
+
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -14004,6 +14049,8 @@ mod tests {
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
                 generation: 0,
+
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -14055,6 +14102,8 @@ mod tests {
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
                 generation: 0,
+
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -14111,6 +14160,8 @@ mod tests {
                 aggregate_id: redemption_aggregate_id("corrupt-redemption-payload"),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
+
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -14168,6 +14219,8 @@ mod tests {
                     symbol: symbol.clone(),
                     quantity: FractionalShares::new(float!(1)),
                     generation: 0,
+
+                    backpressure_streak: BackpressureStreak::default(),
                 })
                 .await
                 .unwrap();
@@ -14233,6 +14286,8 @@ mod tests {
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
                 generation: 0,
+
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -14253,6 +14308,8 @@ mod tests {
                 aggregate_id: live_redemption_id,
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
+
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -14314,6 +14371,7 @@ mod tests {
                 id: id.clone(),
                 amount: usdc(400),
                 revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -15415,6 +15473,7 @@ mod tests {
                 id: id.clone(),
                 amount,
                 revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -16608,6 +16667,7 @@ mod tests {
                 id: id.clone(),
                 amount,
                 revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -16649,6 +16709,7 @@ mod tests {
                 id: id.clone(),
                 amount,
                 revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -16698,6 +16759,7 @@ mod tests {
                 id: id.clone(),
                 amount,
                 revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -16749,6 +16811,7 @@ mod tests {
                 id: id.clone(),
                 amount,
                 revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -17071,6 +17134,7 @@ mod tests {
                 id: id.clone(),
                 amount,
                 revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -17107,6 +17171,7 @@ mod tests {
                 id: id.clone(),
                 amount,
                 revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -17159,6 +17224,7 @@ mod tests {
                 id: id.clone(),
                 amount,
                 revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -17229,6 +17295,7 @@ mod tests {
                 id: id.clone(),
                 amount,
                 revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -17302,6 +17369,7 @@ mod tests {
                 id: id.clone(),
                 amount,
                 revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -17360,6 +17428,7 @@ mod tests {
                 id: id.clone(),
                 amount,
                 revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -17623,6 +17692,7 @@ mod tests {
                 id: id.clone(),
                 amount: usdc(400),
                 revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -17671,6 +17741,7 @@ mod tests {
                 id: id.clone(),
                 amount: usdc(400),
                 revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -17768,6 +17839,7 @@ mod tests {
                 id: id.clone(),
                 amount: usdc(400),
                 revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -17820,6 +17892,7 @@ mod tests {
                 id: id.clone(),
                 amount: usdc(400),
                 revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -17866,6 +17939,7 @@ mod tests {
                 id: id.clone(),
                 amount: usdc(400),
                 revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -17914,6 +17988,7 @@ mod tests {
                 id: id.clone(),
                 amount: usdc(400),
                 revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
