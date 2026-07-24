@@ -3675,7 +3675,7 @@ poll job exists per order regardless of which path pushed it.
 ##### Broker rate-limit (429) backpressure
 
 A `429 Too Many Requests` from Alpaca is not a bug and must not consume a job's
-terminal retry budget or open its circuit breaker. Three call-site shapes, each
+terminal retry budget or fail-stop its worker. Three call-site shapes, each
 handled differently:
 
 - **Apalis jobs**: on a classified 429, the job's `perform()` catches the error

@@ -16,6 +16,7 @@ use alloy::providers::{Identity, Provider, ProviderBuilder, RootProvider};
 use alloy::rpc::client::ClientBuilder;
 use anyhow::Context;
 use apalis::prelude::Status;
+use apalis_core::error::BoxDynError;
 use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
 use sqlx_apalis::sqlite::{SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode};
@@ -52,8 +53,8 @@ use st0x_tokenization::AlpacaTokenizationService;
 use st0x_tokenization::Tokenizer;
 use st0x_wrapper::WrapperService;
 
-use crate::alerts::{NoopNotifier, NotifierError, TelegramNotifier};
-use crate::conductor::exit::{ConductorExit, MonitorTaskError};
+use crate::alerts::{NoopNotifier, Notifier, NotifierError, TelegramNotifier};
+use crate::conductor::exit::{ConductorExit, ConductorExitError, MonitorTaskError};
 use crate::conductor::job::BackpressureStreak;
 use crate::conductor::monitor::order_fills::{CutoffProbe, probe_cutoff_block_support};
 use crate::dashboard::Broadcaster;
@@ -254,7 +255,19 @@ pub(crate) struct Conductor {
     /// Independent token for apalis — cancelled explicitly in Phase 2 after
     /// producers are stopped.
     apalis_shutdown_token: CancellationToken,
+    /// Alerts an operator when a supervised worker fails terminally, awaited
+    /// (bounded by [`TERMINAL_FAILURE_ALERT_TIMEOUT`]) from
+    /// `wait_for_completion` before the process returns a non-zero exit --
+    /// `NoopNotifier` when `[alerts]` is unconfigured.
+    worker_failure_notifier: Arc<dyn Notifier>,
 }
+
+/// Bounds how long `wait_for_completion` waits for the terminal-failure alert
+/// to send before proceeding with process exit. The fail-stop itself
+/// (non-zero exit, systemd restart) is the load-bearing recovery signal; this
+/// alert is a best-effort convenience on top and must never delay it by more
+/// than a few seconds.
+const TERMINAL_FAILURE_ALERT_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Resets a transfer queue's orphaned `Running`/`Queued` rows back to `Pending`
 /// at startup -- run before workers spawn, so any such row is orphaned by a dead
@@ -705,6 +718,12 @@ impl Conductor {
             Duration::from_secs(ctx.apalis_finished_job_cleanup_interval_secs),
         );
 
+        // Built in this synchronous startup path (not inside the spawned
+        // apalis monitor task) so a misconfigured `[alerts]` section fails
+        // boot with `?`, matching the USDC alerting call site's contract.
+        let worker_failure_notifier =
+            build_alert_notifier(ctx.alerts.as_ref(), "Worker failure alerting")?;
+
         let conductor_ctx = builder::ConductorCtx {
             ctx: ctx.clone(),
             cache,
@@ -773,6 +792,7 @@ impl Conductor {
             .maybe_resume_tokenization_ctx(resume_tokenization_ctx)
             .job_cleanup(job_cleanup)
             .telemetry_writer(telemetry_writer)
+            .worker_failure_notifier(worker_failure_notifier)
             .call();
 
         // Publish the recovery handle only after all startup work
@@ -804,8 +824,32 @@ impl Conductor {
             result = &mut self.job_cleanup => ConductorExit::JobCleanup(result),
         };
 
+        // Alert here (the async exit path), not from the sync `on_event`
+        // callback that recorded this failure: awaiting the alert send is
+        // only possible once we are back in an async context, and doing it
+        // here -- before `handle()` propagates the error and the process
+        // exits -- is what guarantees the send actually completes (or times
+        // out) rather than racing runtime teardown.
+        if let ConductorExit::Monitor(Ok(Err(error))) = &exit {
+            self.maybe_alert_terminal_job_failure(error).await;
+        }
+
         match exit {
-            ConductorExit::GracefulShutdown => self.drain_gracefully().await,
+            ConductorExit::GracefulShutdown => {
+                let drain_result = self.drain_gracefully().await;
+
+                // Mirror the direct-Monitor-branch check above: apalis's
+                // RetryPolicy gives up the instant `worker.is_shutting_down()`
+                // is true, so a supervised job mid-retry when a graceful
+                // shutdown begins can still terminalize during the drain
+                // window (Phase 2 of `drain_gracefully`), not just via the
+                // top-level select. The same alert guarantee must apply here.
+                if let Err(ConductorExitError::Monitor(error)) = &drain_result {
+                    self.maybe_alert_terminal_job_failure(error).await;
+                }
+
+                drain_result.map_err(anyhow::Error::from)
+            }
             other => {
                 other.handle()?;
                 Ok(())
@@ -813,8 +857,59 @@ impl Conductor {
         }
     }
 
+    /// Shared guard for the two `wait_for_completion` exit paths (the direct
+    /// Monitor branch and the graceful-drain branch): both need to alert on
+    /// a `MonitorTaskError::TerminalJobFailure` and ignore every other
+    /// `MonitorTaskError` variant, so the destructuring lives here once.
+    async fn maybe_alert_terminal_job_failure(&self, error: &MonitorTaskError) {
+        if let MonitorTaskError::TerminalJobFailure {
+            worker,
+            context,
+            source,
+        } = error
+        {
+            self.alert_terminal_job_failure(worker, context, source)
+                .await;
+        }
+    }
+
+    /// Sends an operator alert for a supervised worker's terminal failure,
+    /// bounded by [`TERMINAL_FAILURE_ALERT_TIMEOUT`] so a slow or
+    /// unreachable Telegram endpoint cannot delay process exit. The alert
+    /// text is assembled here, at the point it is actually needed, rather
+    /// than flattened into a string when the failure was first recorded --
+    /// so `source`'s full `Display` (and, separately, its `#[source]` chain
+    /// on `MonitorTaskError::TerminalJobFailure`) both stay intact.
+    async fn alert_terminal_job_failure(
+        &self,
+        worker: &str,
+        context: &'static str,
+        source: &BoxDynError,
+    ) {
+        let alert = format!(
+            "st0x-hedge: {worker}: {context}: {source}; process will exit, systemd restarts within 30s"
+        );
+
+        match tokio::time::timeout(
+            TERMINAL_FAILURE_ALERT_TIMEOUT,
+            self.worker_failure_notifier.notify(&alert),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => error!(%error, "Failed to send terminal-failure alert"),
+            Err(_) => error!("Timed out sending terminal-failure alert"),
+        }
+    }
+
     /// Two-phase graceful drain: stop producers, then wait for consumers.
-    async fn drain_gracefully(&mut self) -> anyhow::Result<()> {
+    ///
+    /// Returns the raw [`ConductorExitError`] (not flattened to `anyhow`) so
+    /// `wait_for_completion` can still pattern-match a
+    /// `MonitorTaskError::TerminalJobFailure` surfaced during Phase 2 and
+    /// send the same operator alert it sends for the direct-Monitor-exit
+    /// path.
+    async fn drain_gracefully(&mut self) -> Result<(), ConductorExitError> {
         // Phase 1: stop supervised tasks (OrderFillMonitor, PositionMonitor)
         // so they stop enqueuing new jobs.
         info!(target: "shutdown", "Phase 1: stopping producers (supervisor)");
@@ -1012,14 +1107,15 @@ pub(crate) struct AccumulatedPositionExecutionCtx<'a> {
 
 fn check_monitor_drain_result(
     join_result: Result<Result<(), MonitorTaskError>, JoinError>,
-) -> anyhow::Result<()> {
+) -> Result<(), ConductorExitError> {
     let monitor_result = match join_result {
         Ok(inner) => inner,
         Err(join_error) => {
             error!(%join_error, "Monitor task panicked during drain");
-            return Err(
-                anyhow::Error::from(join_error).context("Monitor task panicked during drain")
-            );
+            return Err(ConductorExitError::TaskFailed {
+                task: "Apalis monitor",
+                source: join_error,
+            });
         }
     };
 
@@ -1313,7 +1409,10 @@ impl PositionAndRebalancing {
     }
 }
 
-/// Builds the USDC alerting notifier.
+/// Builds an alert notifier for one `[alerts]`-gated channel. Shared by every
+/// alerting call site (USDC rebalancing, supervised-worker terminal failure)
+/// -- `channel` only labels the log lines so each call site's startup
+/// behaviour stays distinguishable.
 ///
 /// Returns `Ok(Arc<NoopNotifier>)` when `[alerts]` is absent — silence is
 /// the correct behaviour for an unconfigured optional channel.
@@ -1321,18 +1420,19 @@ impl PositionAndRebalancing {
 /// Returns `Err` when `[alerts]` IS present but `TelegramNotifier` fails to
 /// initialise. The caller must propagate this so the server fails to start:
 /// an operator who configured `[alerts]` believes alerts are active; silently
-/// falling back to Noop would suppress all redrive-limit and terminal-error
-/// pages with no runtime indication.
-fn build_usdc_notifier(
+/// falling back to Noop would suppress that channel's alerts with no runtime
+/// indication.
+fn build_alert_notifier(
     alerts: Option<&st0x_config::AlertsCtx>,
+    channel: &'static str,
 ) -> Result<Arc<dyn crate::alerts::Notifier>, NotifierError> {
     let Some(alerts) = alerts else {
-        debug!("USDC alerting: [alerts] section absent, using NoopNotifier");
+        debug!("{channel}: [alerts] section absent, using NoopNotifier");
         return Ok(Arc::new(NoopNotifier));
     };
     let notifier =
         TelegramNotifier::new(&alerts.bot_token, alerts.chat_id, alerts.message_thread_id)?;
-    info!("USDC alerting: Telegram notifier configured");
+    info!("{channel}: Telegram notifier configured");
     Ok(Arc::new(notifier))
 }
 
@@ -1543,7 +1643,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
         let transfer_usdc_to_market_making_queue =
             deps.schedulers.transfer_usdc_to_market_making.clone();
 
-        let usdc_notifier = build_usdc_notifier(deps.ctx.alerts.as_ref())?;
+        let usdc_notifier = build_alert_notifier(deps.ctx.alerts.as_ref(), "USDC alerting")?;
 
         let rebalancing_service = Arc::new(RebalancingService::new(
             RebalancingServiceConfig {
@@ -3649,6 +3749,7 @@ mod tests {
     use st0x_wrapper::{MockWrapper, RATIO_ONE, UnderlyingPerWrapped, Wrapper};
 
     use super::*;
+    use crate::alerts::CapturingNotifier;
     use crate::bindings::IRaindexInventory::{OperatorDeposit, OperatorWithdraw};
     use crate::bindings::IRaindexV6::{
         ClearConfigV2, ClearV3, EvaluableV4, IOV2, OrderV4, TakeOrderConfigV4, TakeOrderV3,
@@ -3814,6 +3915,7 @@ mod tests {
             telemetry_writer: tokio::spawn(pending::<()>()),
             shutdown_token: CancellationToken::new(),
             apalis_shutdown_token: CancellationToken::new(),
+            worker_failure_notifier: Arc::new(NoopNotifier),
         }
     }
 
@@ -10325,6 +10427,7 @@ mod tests {
             telemetry_writer: tokio::spawn(pending::<()>()),
             shutdown_token: shutdown_token.clone(),
             apalis_shutdown_token,
+            worker_failure_notifier: Arc::new(NoopNotifier),
         };
 
         shutdown_token.cancel();
@@ -10341,7 +10444,12 @@ mod tests {
         // Monitor returns an error after shutdown signal.
         let monitor = tokio::spawn(async move {
             apalis_token_clone.cancelled().await;
-            Err(MonitorTaskError::TerminalJobFailure)
+            let source: Arc<BoxDynError> = Arc::new("boom".into());
+            Err(MonitorTaskError::TerminalJobFailure {
+                worker: "test-worker-0".to_string(),
+                context: "terminal failure",
+                source,
+            })
         });
 
         let job_cleanup = tokio::spawn(pending::<()>());
@@ -10353,6 +10461,7 @@ mod tests {
             telemetry_writer: tokio::spawn(pending::<()>()),
             shutdown_token: shutdown_token.clone(),
             apalis_shutdown_token,
+            worker_failure_notifier: Arc::new(NoopNotifier),
         };
 
         shutdown_token.cancel();
@@ -10363,6 +10472,242 @@ mod tests {
         );
     }
 
+    /// M1 regression test: a supervised worker's terminal failure must
+    /// actually deliver an operator alert, not merely fire the fail-stop
+    /// signal. Asserts the `CapturingNotifier` received the message --
+    /// containing the worker name and failure text -- via
+    /// `wait_for_completion`'s async exit path, proving the alert send
+    /// completes rather than racing (and losing to) process teardown the way
+    /// a fire-and-forget `tokio::spawn` from the sync `on_event` callback
+    /// would.
+    #[tokio::test]
+    async fn wait_for_completion_sends_terminal_failure_alert_before_propagating() {
+        let supervisor = SupervisorBuilder::default().build().run();
+        let shutdown_token = CancellationToken::new();
+        let apalis_shutdown_token = CancellationToken::new();
+
+        // Monitor fails immediately -- no shutdown signal involved, so this
+        // exercises the direct Monitor branch of `wait_for_completion`'s
+        // select, not the graceful-drain path.
+        let monitor = tokio::spawn(async {
+            let source: Arc<BoxDynError> = Arc::new("boom".into());
+            Err(MonitorTaskError::TerminalJobFailure {
+                worker: "test-worker-0".to_string(),
+                context: "terminal failure",
+                source,
+            })
+        });
+
+        let job_cleanup = tokio::spawn(pending::<()>());
+        let notifier = Arc::new(CapturingNotifier::default());
+
+        let mut conductor = Conductor {
+            supervisor,
+            monitor,
+            job_cleanup,
+            telemetry_writer: tokio::spawn(pending::<()>()),
+            shutdown_token,
+            apalis_shutdown_token,
+            worker_failure_notifier: notifier.clone(),
+        };
+
+        let error = conductor.wait_for_completion().await.unwrap_err();
+        assert!(
+            error.to_string().contains("terminal failure"),
+            "the terminal job failure must still propagate after alerting; got: {error}"
+        );
+        assert!(
+            format!("{error:?}").contains("boom"),
+            "the original error must survive as a #[source] on MonitorTaskError so anyhow's \
+             'Caused by:' chain still surfaces it (not flattened into a string); got: {error:?}"
+        );
+
+        let messages = notifier.messages();
+        assert_eq!(
+            messages.len(),
+            1,
+            "exactly one alert must be sent for the terminal failure; got: {messages:?}"
+        );
+        assert!(
+            messages[0].contains("test-worker-0") && messages[0].contains("boom"),
+            "the alert must name the worker and the failure text; got: {}",
+            messages[0]
+        );
+    }
+
+    /// Same M1 guarantee as
+    /// `wait_for_completion_sends_terminal_failure_alert_before_propagating`,
+    /// but for the graceful-shutdown drain path: `shutdown_token` cancels
+    /// first, so the outer biased `select!` takes `GracefulShutdown` rather
+    /// than the direct `Monitor` branch, and the monitor only resolves with
+    /// `TerminalJobFailure` once `drain_gracefully`'s Phase 2 cancels
+    /// `apalis_shutdown_token` -- mirroring apalis's own `RetryPolicy` giving
+    /// up mid-retry the instant `worker.is_shutting_down()` becomes true.
+    /// The alert must still fire, and exactly once.
+    #[tokio::test]
+    async fn wait_for_completion_sends_terminal_failure_alert_during_graceful_drain() {
+        let supervisor = SupervisorBuilder::default().build().run();
+        let shutdown_token = CancellationToken::new();
+        let apalis_shutdown_token = CancellationToken::new();
+        let apalis_token_clone = apalis_shutdown_token.clone();
+
+        // Only resolves with a terminal failure after Phase 2 of
+        // `drain_gracefully` cancels the apalis shutdown token -- proving
+        // this exercises the drain window, not the top-level select branch.
+        let monitor = tokio::spawn(async move {
+            apalis_token_clone.cancelled().await;
+            let source: Arc<BoxDynError> = Arc::new("boom".into());
+            Err(MonitorTaskError::TerminalJobFailure {
+                worker: "test-worker-0".to_string(),
+                context: "terminal failure",
+                source,
+            })
+        });
+
+        let job_cleanup = tokio::spawn(pending::<()>());
+        let notifier = Arc::new(CapturingNotifier::default());
+
+        let mut conductor = Conductor {
+            supervisor,
+            monitor,
+            job_cleanup,
+            telemetry_writer: tokio::spawn(pending::<()>()),
+            shutdown_token: shutdown_token.clone(),
+            apalis_shutdown_token,
+            worker_failure_notifier: notifier.clone(),
+        };
+
+        shutdown_token.cancel();
+        let error = conductor.wait_for_completion().await.unwrap_err();
+        assert!(
+            error.to_string().contains("terminal failure"),
+            "the terminal job failure surfaced during drain must still propagate; got: {error}"
+        );
+
+        let messages = notifier.messages();
+        assert_eq!(
+            messages.len(),
+            1,
+            "exactly one alert must be sent for a terminal failure discovered during the \
+             graceful-shutdown drain window; got: {messages:?}"
+        );
+        assert!(
+            messages[0].contains("test-worker-0") && messages[0].contains("boom"),
+            "the alert must name the worker and the failure text; got: {}",
+            messages[0]
+        );
+    }
+
+    /// A [`Notifier`] whose `notify()` never resolves, for asserting
+    /// [`TERMINAL_FAILURE_ALERT_TIMEOUT`] actually bounds
+    /// `alert_terminal_job_failure`'s wait instead of blocking process exit
+    /// indefinitely on a stalled alert channel.
+    struct HangingNotifier;
+
+    #[async_trait::async_trait]
+    impl Notifier for HangingNotifier {
+        async fn notify(&self, _message: &str) -> Result<(), NotifierError> {
+            std::future::pending().await
+        }
+    }
+
+    /// A [`Notifier`] whose `notify()` always errors, for asserting the
+    /// fail-stop still propagates even when the alert channel itself fails
+    /// to deliver.
+    struct ErroringNotifier;
+
+    #[async_trait::async_trait]
+    impl Notifier for ErroringNotifier {
+        async fn notify(&self, _message: &str) -> Result<(), NotifierError> {
+            Err(NotifierError::ApiError {
+                status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                body: "simulated Telegram outage".to_string(),
+            })
+        }
+    }
+
+    /// The alert must never block the fail-stop: a hung notifier still lets
+    /// `wait_for_completion` return the propagated `TerminalJobFailure`
+    /// within [`TERMINAL_FAILURE_ALERT_TIMEOUT`]. Uses paused virtual time so
+    /// the 3s bound is exercised without the test actually waiting 3s.
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_completion_propagates_past_a_hung_notifier_within_the_timeout() {
+        let supervisor = SupervisorBuilder::default().build().run();
+        let shutdown_token = CancellationToken::new();
+        let apalis_shutdown_token = CancellationToken::new();
+
+        let monitor = tokio::spawn(async {
+            let source: Arc<BoxDynError> = Arc::new("boom".into());
+            Err(MonitorTaskError::TerminalJobFailure {
+                worker: "test-worker-0".to_string(),
+                context: "terminal failure",
+                source,
+            })
+        });
+
+        let job_cleanup = tokio::spawn(pending::<()>());
+
+        let mut conductor = Conductor {
+            supervisor,
+            monitor,
+            job_cleanup,
+            telemetry_writer: tokio::spawn(pending::<()>()),
+            shutdown_token,
+            apalis_shutdown_token,
+            worker_failure_notifier: Arc::new(HangingNotifier),
+        };
+
+        let error = tokio::time::timeout(Duration::from_secs(10), conductor.wait_for_completion())
+            .await
+            .expect(
+                "wait_for_completion must not hang past TERMINAL_FAILURE_ALERT_TIMEOUT even \
+                 with a hung notifier",
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("terminal failure"),
+            "the terminal job failure must still propagate despite a hung notifier; got: {error}"
+        );
+    }
+
+    /// The alert must never swallow the fail-stop: a notifier that errors
+    /// still lets `wait_for_completion` return the propagated
+    /// `TerminalJobFailure`.
+    #[tokio::test]
+    async fn wait_for_completion_propagates_when_the_notifier_itself_errors() {
+        let supervisor = SupervisorBuilder::default().build().run();
+        let shutdown_token = CancellationToken::new();
+        let apalis_shutdown_token = CancellationToken::new();
+
+        let monitor = tokio::spawn(async {
+            let source: Arc<BoxDynError> = Arc::new("boom".into());
+            Err(MonitorTaskError::TerminalJobFailure {
+                worker: "test-worker-0".to_string(),
+                context: "terminal failure",
+                source,
+            })
+        });
+
+        let job_cleanup = tokio::spawn(pending::<()>());
+
+        let mut conductor = Conductor {
+            supervisor,
+            monitor,
+            job_cleanup,
+            telemetry_writer: tokio::spawn(pending::<()>()),
+            shutdown_token,
+            apalis_shutdown_token,
+            worker_failure_notifier: Arc::new(ErroringNotifier),
+        };
+
+        let error = conductor.wait_for_completion().await.unwrap_err();
+        assert!(
+            error.to_string().contains("terminal failure"),
+            "the terminal job failure must still propagate even when the notifier itself \
+             errors; got: {error}"
+        );
+    }
+
     #[test]
     fn check_monitor_drain_result_ok() {
         check_monitor_drain_result(Ok(Ok(()))).unwrap();
@@ -10370,8 +10715,13 @@ mod tests {
 
     #[test]
     fn check_monitor_drain_result_propagates_monitor_error() {
-        let error =
-            check_monitor_drain_result(Ok(Err(MonitorTaskError::TerminalJobFailure))).unwrap_err();
+        let source: Arc<BoxDynError> = Arc::new("boom".into());
+        let error = check_monitor_drain_result(Ok(Err(MonitorTaskError::TerminalJobFailure {
+            worker: "test-worker-0".to_string(),
+            context: "terminal failure",
+            source,
+        })))
+        .unwrap_err();
 
         assert!(
             error.to_string().contains("Apalis worker failed"),
@@ -11057,21 +11407,26 @@ mod tests {
         );
     }
 
-    /// When `[alerts]` is absent, `build_usdc_notifier` returns a `NoopNotifier`
-    /// that silently discards notifications without error.
+    /// When `[alerts]` is absent, `build_alert_notifier` returns a
+    /// `NoopNotifier` that silently discards notifications without error --
+    /// exercised here through the USDC alerting call site's exact arguments.
+    /// `channel` only labels log lines (see `build_alert_notifier`'s doc), so
+    /// this also covers the supervised-worker terminal-failure call site,
+    /// which shares this exact code path with a different `channel` string.
     #[tokio::test]
     async fn build_usdc_notifier_returns_ok_noop_when_alerts_absent() {
-        let notifier = build_usdc_notifier(None).unwrap();
+        let notifier = build_alert_notifier(None, "USDC alerting").unwrap();
         notifier
             .notify("test message")
             .await
             .expect("NoopNotifier must not error on notify");
     }
 
-    /// When `[alerts]` IS present, `build_usdc_notifier` constructs a real
+    /// When `[alerts]` IS present, `build_alert_notifier` constructs a real
     /// Telegram notifier and returns `Ok` -- it must NOT fail startup for a
     /// well-formed config, and it must NOT silently fall back to `NoopNotifier`
     /// (which would suppress every redrive-limit and terminal-error page).
+    /// Exercised here through the USDC alerting call site's exact arguments.
     ///
     /// The error branch (`Err(NotifierError::ClientBuild)`) is only reachable on
     /// a reqwest/TLS backend init failure; it cannot be triggered deterministically
@@ -11079,6 +11434,9 @@ mod tests {
     /// site the `?` propagation fails startup, which is the behaviour that matters.
     /// `notify()` is deliberately not exercised: the present-branch notifier posts
     /// to the live Telegram API, which a unit test must never reach.
+    /// `channel` only labels log lines (see `build_alert_notifier`'s doc), so
+    /// this also covers the supervised-worker terminal-failure call site,
+    /// which shares this exact code path with a different `channel` string.
     #[tokio::test]
     async fn build_usdc_notifier_returns_ok_telegram_when_alerts_present() {
         let alerts = st0x_config::AlertsCtx {
@@ -11090,7 +11448,7 @@ mod tests {
             message_thread_id: Some(42),
         };
 
-        build_usdc_notifier(Some(&alerts))
+        build_alert_notifier(Some(&alerts), "USDC alerting")
             .expect("a well-formed [alerts] config must yield a notifier, not a startup error");
     }
 }

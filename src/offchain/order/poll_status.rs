@@ -1239,7 +1239,6 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use apalis::prelude::Monitor;
-    use apalis_core::worker::ext::circuit_breaker::config::CircuitBreakerConfig;
     use chrono::Utc;
     use httpmock::prelude::*;
     use sqlx_apalis::ConnectOptions;
@@ -1256,7 +1255,7 @@ mod tests {
 
     use super::*;
     use crate::conductor::job::{
-        FAIL_STOP_RECOVERY_TIMEOUT, FailureInjector, build_supervised_worker, build_worker_inner,
+        FailureInjector, TerminalFailureSignal, build_supervised_worker, build_worker_inner,
     };
     use crate::offchain::order::{
         NoFillOutcome, OffchainOrderCommand, TerminalPositionFinalization, noop_order_placer,
@@ -4286,10 +4285,7 @@ mod tests {
             .unwrap();
 
         let ctx = Arc::new(ctx);
-        let failure_notify = Arc::new(tokio::sync::Notify::new());
-        let fail_stop = CircuitBreakerConfig::default()
-            .with_failure_threshold(1)
-            .with_recovery_timeout(FAIL_STOP_RECOVERY_TIMEOUT);
+        let failure_notify = Arc::new(TerminalFailureSignal::default());
 
         let monitor_handle = tokio::spawn({
             let failure_notify = failure_notify.clone();
@@ -4303,7 +4299,6 @@ mod tests {
                         index,
                         queue.clone(),
                         ctx.clone(),
-                        fail_stop.clone(),
                         failure_notify.clone(),
                         FailureInjector::new(),
                     )
