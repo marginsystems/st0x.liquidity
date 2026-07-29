@@ -201,9 +201,9 @@ WorkerBuilder::new(name)
   failed job handler invocations within a single worker execution cycle.
   `retries(3)` = 4 total handler attempts before apalis marks the job as
   `Failed` with `attempts += 1` and re-queues it for another cycle. The
-  durable SQL limit is 25 total attempts (`JOB_MAX_ATTEMPTS`), so one exhausted
-  job produces up to 25 terminal `Event::Error` firings and 25 circuit
-  pause/recover cycles before apalis marks it `Killed`. `RETRY_BACKOFF` is a
+  durable SQL limit is 4 total attempts (`JOB_MAX_ATTEMPTS`), so one exhausted
+  job produces a single terminal `Event::Error` and a single circuit
+  pause/recover cycle before apalis marks it `Killed`. `RETRY_BACKOFF` is a
   deterministic exponential backoff (1s base, doubles each attempt, capped at
   30s) so transient failures (RPC blips, broker rate limits) don't fast-fail
   into the recovering circuit. No jitter -- single-worker queues don't thunder.

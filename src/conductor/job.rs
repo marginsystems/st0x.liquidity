@@ -40,7 +40,7 @@ pub(crate) const WORKER_CIRCUIT_POLICY: WorkerCircuitPolicy = WorkerCircuitPolic
 );
 
 pub(crate) const JOB_RETRIES: usize = 3;
-pub(crate) const JOB_MAX_ATTEMPTS: u32 = 25;
+pub(crate) const JOB_MAX_ATTEMPTS: u32 = (JOB_RETRIES + 1) as u32;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct WorkerCircuitPolicy {
@@ -148,61 +148,67 @@ impl RecoveringWorkerCircuit {
         let last_alerted = self.last_alerted.clone();
         let realert_interval = self.policy.realert_interval;
         tokio::spawn(async move {
+            let mut backoff = RETRY_BACKOFF.clone();
             tokio::time::sleep(recovery_timeout).await;
 
-            match worker.resume() {
-                Ok(()) => {
-                    *state
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                        WorkerCircuitState::Closed {
-                        consecutive_failures: 0,
-                    };
-                    info!(
-                        worker = %worker.name(),
-                        worker_circuit_transition = %WorkerCircuitTransition::Recovered,
-                        "Worker circuit recovered after cooldown"
-                    );
-                }
-                Err(_) if worker.is_running() => {
-                    *state
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                        WorkerCircuitState::Closed {
-                        consecutive_failures: 0,
-                    };
-                    info!(
-                        worker = %worker.name(),
-                        worker_circuit_transition = %WorkerCircuitTransition::Recovered,
-                        "Worker circuit was already resumed after cooldown"
-                    );
-                }
-                Err(error) => {
-                    let worker_name = worker.name().to_owned();
-                    error!(
-                        worker = %worker_name,
-                        ?error,
-                        "Worker circuit cooldown elapsed but the worker could not resume; circuit remains open"
-                    );
-                    let mut last = last_alerted
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if last.map_or(true, |l| {
-                        Instant::now().saturating_duration_since(l) >= realert_interval
-                    }) {
-                        *last = Some(Instant::now());
-                        drop(last);
-                        let message = format!(
-                            "{}: worker {} could not resume after cooldown; circuit remains open",
-                            error_msg, worker_name,
+            loop {
+                match worker.resume() {
+                    Ok(()) => {
+                        *state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            WorkerCircuitState::Closed {
+                            consecutive_failures: 0,
+                        };
+                        info!(
+                            worker = %worker.name(),
+                            worker_circuit_transition = %WorkerCircuitTransition::Recovered,
+                            "Worker circuit recovered after cooldown"
                         );
-                        if let Err(notify_error) = notifier.notify(&message).await {
-                            warn!(
-                                worker = %worker_name,
-                                ?notify_error,
-                                "Failed to deliver worker recovery-failure alert",
+                        break;
+                    }
+                    Err(_) if worker.is_running() => {
+                        *state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            WorkerCircuitState::Closed {
+                            consecutive_failures: 0,
+                        };
+                        info!(
+                            worker = %worker.name(),
+                            worker_circuit_transition = %WorkerCircuitTransition::Recovered,
+                            "Worker circuit was already resumed after cooldown"
+                        );
+                        break;
+                    }
+                    Err(error) => {
+                        let worker_name = worker.name().to_owned();
+                        error!(
+                            worker = %worker_name,
+                            ?error,
+                            "Worker circuit cooldown elapsed but the worker could not resume; circuit remains open"
+                        );
+                        let mut last = last_alerted
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if last.map_or(true, |l| {
+                            Instant::now().saturating_duration_since(l) >= realert_interval
+                        }) {
+                            *last = Some(Instant::now());
+                            drop(last);
+                            let message = format!(
+                                "{}: worker {} could not resume after cooldown; circuit remains open",
+                                error_msg, worker_name,
                             );
+                            if let Err(notify_error) = notifier.notify(&message).await {
+                                warn!(
+                                    worker = %worker_name,
+                                    ?notify_error,
+                                    "Failed to deliver worker recovery-failure alert",
+                                );
+                            }
                         }
+                        backoff.next_backoff().await;
                     }
                 }
             }
