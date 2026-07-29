@@ -141,9 +141,12 @@ impl RecoveringWorkerCircuit {
         Some(consecutive_failures)
     }
 
-    fn schedule_recovery(&self, worker: WorkerContext) {
+    fn schedule_recovery(&self, worker: WorkerContext, error_msg: &'static str) {
         let recovery_timeout = self.policy.recovery_timeout;
         let state = self.state.clone();
+        let notifier = self.notifier.clone();
+        let last_alerted = self.last_alerted.clone();
+        let realert_interval = self.policy.realert_interval;
         tokio::spawn(async move {
             tokio::time::sleep(recovery_timeout).await;
 
@@ -175,11 +178,32 @@ impl RecoveringWorkerCircuit {
                     );
                 }
                 Err(error) => {
+                    let worker_name = worker.name().to_owned();
                     error!(
-                        worker = %worker.name(),
+                        worker = %worker_name,
                         ?error,
                         "Worker circuit cooldown elapsed but the worker could not resume; circuit remains open"
                     );
+                    let mut last = last_alerted
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if last.map_or(true, |l| {
+                        Instant::now().saturating_duration_since(l) >= realert_interval
+                    }) {
+                        *last = Some(Instant::now());
+                        drop(last);
+                        let message = format!(
+                            "{}: worker {} could not resume after cooldown; circuit remains open",
+                            error_msg, worker_name,
+                        );
+                        if let Err(notify_error) = notifier.notify(&message).await {
+                            warn!(
+                                worker = %worker_name,
+                                ?notify_error,
+                                "Failed to deliver worker recovery-failure alert",
+                            );
+                        }
+                    }
                 }
             }
         });
@@ -261,7 +285,7 @@ pub(crate) fn on_recovering_circuit_event(
             if circuit.should_alert(Instant::now()) {
                 circuit.alert(ctx.name().clone(), error_msg);
             }
-            circuit.schedule_recovery(ctx.clone());
+            circuit.schedule_recovery(ctx.clone(), error_msg);
         }
         _ => {}
     }

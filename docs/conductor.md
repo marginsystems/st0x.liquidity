@@ -198,9 +198,12 @@ WorkerBuilder::new(name)
   `CallAllUnordered` processes jobs in parallel and a failing job can't prevent
   the next job from starting.
 - **`.retry(RetryPolicy::retries(3).with_backoff(RETRY_BACKOFF))`** — retries
-  failed jobs (replaces backon in the handler). `retries(3)` = 4 total attempts.
-  Every queued task carries the same four-attempt durable SQL limit, so one
-  exhausted job produces exactly one terminal worker event. `RETRY_BACKOFF` is a
+  failed job handler invocations within a single worker execution cycle.
+  `retries(3)` = 4 total handler attempts before apalis marks the job as
+  `Failed` with `attempts += 1` and re-queues it for another cycle. The
+  durable SQL limit is 25 total attempts (`JOB_MAX_ATTEMPTS`), so one exhausted
+  job produces up to 25 terminal `Event::Error` firings and 25 circuit
+  pause/recover cycles before apalis marks it `Killed`. `RETRY_BACKOFF` is a
   deterministic exponential backoff (1s base, doubles each attempt, capped at
   30s) so transient failures (RPC blips, broker rate limits) don't fast-fail
   into the recovering circuit. No jitter -- single-worker queues don't thunder.
