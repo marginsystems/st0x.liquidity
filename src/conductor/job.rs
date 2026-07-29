@@ -40,7 +40,6 @@ pub(crate) const WORKER_CIRCUIT_POLICY: WorkerCircuitPolicy = WorkerCircuitPolic
 );
 
 pub(crate) const JOB_RETRIES: usize = 3;
-const JOB_MAX_ATTEMPTS: u32 = 4;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct WorkerCircuitPolicy {
@@ -146,28 +145,41 @@ impl RecoveringWorkerCircuit {
         let state = self.state.clone();
         tokio::spawn(async move {
             tokio::time::sleep(recovery_timeout).await;
-            *state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = WorkerCircuitState::Closed {
-                consecutive_failures: 0,
-            };
 
             match worker.resume() {
-                Ok(()) => info!(
-                    worker = %worker.name(),
-                    worker_circuit_transition = %WorkerCircuitTransition::Recovered,
-                    "Worker circuit recovered after cooldown"
-                ),
-                Err(_) if worker.is_running() => info!(
-                    worker = %worker.name(),
-                    worker_circuit_transition = %WorkerCircuitTransition::Recovered,
-                    "Worker circuit was already resumed after cooldown"
-                ),
-                Err(error) => warn!(
-                    worker = %worker.name(),
-                    ?error,
-                    "Worker circuit cooldown elapsed but the worker could not resume"
-                ),
+                Ok(()) => {
+                    *state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        WorkerCircuitState::Closed {
+                        consecutive_failures: 0,
+                    };
+                    info!(
+                        worker = %worker.name(),
+                        worker_circuit_transition = %WorkerCircuitTransition::Recovered,
+                        "Worker circuit recovered after cooldown"
+                    );
+                }
+                Err(_) if worker.is_running() => {
+                    *state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        WorkerCircuitState::Closed {
+                        consecutive_failures: 0,
+                    };
+                    info!(
+                        worker = %worker.name(),
+                        worker_circuit_transition = %WorkerCircuitTransition::Recovered,
+                        "Worker circuit was already resumed after cooldown"
+                    );
+                }
+                Err(error) => {
+                    error!(
+                        worker = %worker.name(),
+                        ?error,
+                        "Worker circuit cooldown elapsed but the worker could not resume"
+                    );
+                }
             }
         });
     }
@@ -355,9 +367,7 @@ impl<Task: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static> JobQueu
     }
 
     pub(crate) async fn push(&mut self, task: Task) -> Result<(), QueuePushError> {
-        let task = TaskBuilder::<Task, SqliteContext, _>::new(task)
-            .max_attempts(JOB_MAX_ATTEMPTS)
-            .build();
+        let task = TaskBuilder::<Task, SqliteContext, _>::new(task).build();
         Ok(TaskSink::push_task(&mut self.0, task).await?)
     }
 
@@ -372,7 +382,6 @@ impl<Task: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static> JobQueu
         delay: Duration,
     ) -> Result<(), QueuePushError> {
         let scheduled = TaskBuilder::<Task, SqliteContext, _>::new(task)
-            .max_attempts(JOB_MAX_ATTEMPTS)
             .run_after(delay)
             .build();
         Ok(TaskSink::push_task(&mut self.0, scheduled).await?)
@@ -967,11 +976,6 @@ mod tests {
             "workers run with concurrency(1), so the SQLite fetch buffer must \
              not reserve extra rows as Queued before a handler can execute them",
         );
-    }
-
-    #[test]
-    fn durable_attempt_limit_matches_middleware_retry_budget() {
-        assert_eq!(usize::try_from(JOB_MAX_ATTEMPTS).unwrap(), JOB_RETRIES + 1,);
     }
 
     #[test]
