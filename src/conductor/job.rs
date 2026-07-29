@@ -172,6 +172,14 @@ impl RecoveringWorkerCircuit {
         });
     }
 
+    fn is_open(&self) -> bool {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        matches!(*state, WorkerCircuitState::Open)
+    }
+
     fn should_alert(&self, now: Instant) -> bool {
         let mut last_alerted = self
             .last_alerted
@@ -210,6 +218,14 @@ pub(crate) fn on_recovering_circuit_event(
         Event::Success => circuit.record_success(),
         Event::Error(error) => {
             let Some(consecutive_failures) = circuit.record_failure() else {
+                if circuit.is_open() {
+                    warn!(
+                        worker = %ctx.name(),
+                        %error,
+                        error_msg,
+                        "Circuit is already open; worker may still be processing jobs",
+                    );
+                }
                 return;
             };
 
