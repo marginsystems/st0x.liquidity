@@ -174,10 +174,16 @@ impl RecoveringWorkerCircuit {
                     );
                 }
                 Err(error) => {
+                    *state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        WorkerCircuitState::Closed {
+                        consecutive_failures: 0,
+                    };
                     error!(
                         worker = %worker.name(),
                         ?error,
-                        "Worker circuit cooldown elapsed but the worker could not resume"
+                        "Worker circuit cooldown elapsed but the worker could not resume; circuit closed"
                     );
                 }
             }
