@@ -41,6 +41,7 @@ pub(crate) const WORKER_CIRCUIT_POLICY: WorkerCircuitPolicy = WorkerCircuitPolic
 
 pub(crate) const JOB_RETRIES: usize = 3;
 pub(crate) const JOB_MAX_ATTEMPTS: u32 = (JOB_RETRIES + 1) as u32;
+pub(crate) const RECOVERY_MAX_RETRIES: u32 = 25;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct WorkerCircuitPolicy {
@@ -67,6 +68,13 @@ impl WorkerCircuitPolicy {
 enum WorkerCircuitState {
     Closed { consecutive_failures: u32 },
     Open,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum FailureOutcome {
+    Opened(u32),
+    BelowThreshold,
+    AlreadyOpen,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -116,7 +124,7 @@ impl RecoveringWorkerCircuit {
         }
     }
 
-    fn record_failure(&self) -> Option<u32> {
+    fn record_failure(&self) -> FailureOutcome {
         let mut state = self
             .state
             .lock()
@@ -125,7 +133,7 @@ impl RecoveringWorkerCircuit {
             consecutive_failures,
         } = *state
         else {
-            return None;
+            return FailureOutcome::AlreadyOpen;
         };
 
         let consecutive_failures = consecutive_failures.saturating_add(1);
@@ -133,12 +141,12 @@ impl RecoveringWorkerCircuit {
             *state = WorkerCircuitState::Closed {
                 consecutive_failures,
             };
-            return None;
+            return FailureOutcome::BelowThreshold;
         }
 
         *state = WorkerCircuitState::Open;
         drop(state);
-        Some(consecutive_failures)
+        FailureOutcome::Opened(consecutive_failures)
     }
 
     fn schedule_recovery(&self, worker: WorkerContext, error_msg: &'static str) {
@@ -149,6 +157,7 @@ impl RecoveringWorkerCircuit {
         let realert_interval = self.policy.realert_interval;
         tokio::spawn(async move {
             let mut backoff = RETRY_BACKOFF.clone();
+            let mut retries_remaining = RECOVERY_MAX_RETRIES;
             tokio::time::sleep(recovery_timeout).await;
 
             loop {
@@ -183,19 +192,32 @@ impl RecoveringWorkerCircuit {
                     }
                     Err(error) => {
                         let worker_name = worker.name().to_owned();
+                        if retries_remaining == 0 {
+                            error!(
+                                worker = %worker_name,
+                                ?error,
+                                "Worker circuit cooldown elapsed but the worker could not resume \
+                                 after {RECOVERY_MAX_RETRIES} retries; circuit remains open permanently"
+                            );
+                            break;
+                        }
+                        retries_remaining -= 1;
+
                         error!(
                             worker = %worker_name,
+                            retries_remaining,
                             ?error,
                             "Worker circuit cooldown elapsed but the worker could not resume; circuit remains open"
                         );
-                        let mut last = last_alerted
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        if last.map_or(true, |l| {
-                            Instant::now().saturating_duration_since(l) >= realert_interval
-                        }) {
-                            *last = Some(Instant::now());
-                            drop(last);
+                        let should_alert = {
+                            let last = last_alerted
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            last.map_or(true, |l| {
+                                Instant::now().saturating_duration_since(l) >= realert_interval
+                            })
+                        };
+                        if should_alert {
                             let message = format!(
                                 "{}: worker {} could not resume after cooldown; circuit remains open",
                                 error_msg, worker_name,
@@ -206,6 +228,11 @@ impl RecoveringWorkerCircuit {
                                     ?notify_error,
                                     "Failed to deliver worker recovery-failure alert",
                                 );
+                            } else {
+                                *last_alerted
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                    Some(Instant::now());
                             }
                         }
                         backoff.next_backoff().await;
@@ -215,31 +242,19 @@ impl RecoveringWorkerCircuit {
         });
     }
 
-    fn is_open(&self) -> bool {
-        let state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        matches!(*state, WorkerCircuitState::Open)
-    }
-
     fn should_alert(&self, now: Instant) -> bool {
-        let mut last_alerted = self
+        let last_alerted = self
             .last_alerted
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if last_alerted
-            .is_some_and(|last| now.saturating_duration_since(last) < self.policy.realert_interval)
-        {
-            return false;
-        }
-
-        *last_alerted = Some(now);
-        true
+        last_alerted.map_or(true, |last| {
+            now.saturating_duration_since(last) >= self.policy.realert_interval
+        })
     }
 
     fn alert(&self, worker_name: String, error_msg: &'static str) {
         let notifier = self.notifier.clone();
+        let last_alerted = self.last_alerted.clone();
         tokio::spawn(async move {
             let message = format!("{error_msg}: worker {worker_name} paused for recovery");
             if let Err(error) = notifier.notify(&message).await {
@@ -248,6 +263,10 @@ impl RecoveringWorkerCircuit {
                     ?error,
                     "Failed to deliver worker circuit-open alert"
                 );
+            } else {
+                *last_alerted
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Instant::now());
             }
         });
     }
@@ -260,16 +279,20 @@ pub(crate) fn on_recovering_circuit_event(
     move |ctx, event| match event {
         Event::Success => circuit.record_success(),
         Event::Error(error) => {
-            let Some(consecutive_failures) = circuit.record_failure() else {
-                if circuit.is_open() {
+            let outcome = circuit.record_failure();
+
+            let consecutive_failures = match outcome {
+                FailureOutcome::AlreadyOpen => {
                     warn!(
                         worker = %ctx.name(),
                         %error,
                         error_msg,
                         "Circuit is already open; worker may still be processing jobs",
                     );
+                    return;
                 }
-                return;
+                FailureOutcome::BelowThreshold => return,
+                FailureOutcome::Opened(consecutive_failures) => consecutive_failures,
             };
 
             if let Err(pause_error) = ctx.pause() {
@@ -1196,21 +1219,51 @@ mod tests {
         Event::Error(Arc::new(error))
     }
 
-    #[test]
-    fn worker_circuit_suppresses_alerts_until_realert_interval_elapses() {
+    #[tokio::test]
+    async fn worker_circuit_suppresses_alerts_until_realert_interval_elapses() {
+        let notifier = Arc::new(crate::alerts::CapturingNotifier::default());
         let circuit = RecoveringWorkerCircuit::new(
             WorkerCircuitPolicy::new(
                 NonZeroU32::MIN,
                 Duration::from_millis(10),
                 Duration::from_secs(60 * 60),
             ),
-            Arc::new(crate::alerts::CapturingNotifier::default()),
+            notifier,
         );
         let first_alert = Instant::now();
 
         assert!(circuit.should_alert(first_alert));
+        circuit.alert("test-worker".into(), "test");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
         assert!(!circuit.should_alert(first_alert + Duration::from_secs(5 * 60)));
         assert!(circuit.should_alert(first_alert + Duration::from_secs(60 * 60)));
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn worker_circuit_drops_errors_atomically_while_circuit_is_open() {
+        let notifier = Arc::new(crate::alerts::CapturingNotifier::default());
+        let circuit = RecoveringWorkerCircuit::new(
+            WorkerCircuitPolicy::new(
+                NonZeroU32::MIN,
+                // long recovery timeout so the circuit stays open during the test
+                Duration::from_secs(60 * 60),
+                Duration::from_secs(60 * 60),
+            ),
+            notifier,
+        );
+        let on_event = on_recovering_circuit_event(circuit, "Test worker circuit opened");
+        let mut worker = WorkerContext::new::<()>("circuit-open-test-worker");
+        worker.start().unwrap();
+
+        on_event(&worker, &test_error_event());
+        assert!(worker.is_paused());
+
+        on_event(&worker, &test_error_event());
+        assert!(logs_contain(
+            "Circuit is already open; worker may still be processing jobs"
+        ));
     }
 
     #[tokio::test]

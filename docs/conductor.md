@@ -199,14 +199,17 @@ WorkerBuilder::new(name)
   the next job from starting.
 - **`.retry(RetryPolicy::retries(3).with_backoff(RETRY_BACKOFF))`** — retries
   failed job handler invocations within a single worker execution cycle.
-  `retries(3)` = 4 total handler attempts before apalis marks the job as
-  `Failed` with `attempts += 1` and re-queues it for another cycle. The
-  durable SQL limit is 4 total attempts (`JOB_MAX_ATTEMPTS`), so one exhausted
-  job produces a single terminal `Event::Error` and a single circuit
-  pause/recover cycle before apalis marks it `Killed`. `RETRY_BACKOFF` is a
-  deterministic exponential backoff (1s base, doubles each attempt, capped at
-  30s) so transient failures (RPC blips, broker rate limits) don't fast-fail
-  into the recovering circuit. No jitter -- single-worker queues don't thunder.
+  `retries(3)` = 4 total handler attempts per SQL pickup. After these exhaust,
+  apalis marks the job as `Failed` with SQL `attempts += 1`, emits one
+  `Event::Error`, and re-queues it for another cycle until the SQL
+  `attempts >= max_attempts`. The durable SQL limit is 4 total attempts
+  (`JOB_MAX_ATTEMPTS`), so each exhausted SQL pickup produces one
+  `Event::Error` — up to 4 events total, and up to 4 circuit pause/recover
+  cycles — before apalis marks the row `Killed` and stops re-queuing.
+  `RETRY_BACKOFF` is a deterministic exponential backoff (1s base, doubles each
+  attempt, capped at 30s) so transient failures (RPC blips, broker rate limits)
+  don't fast-fail into the recovering circuit. No jitter — single-worker queues
+  don't thunder.
 - **`.on_event(recovering_circuit_event)`** — observes terminal `Event::Error`
   and successful `Event::Success` outcomes. The first consecutive terminal
   failure opens the local worker circuit, pauses that worker, emits a structured
