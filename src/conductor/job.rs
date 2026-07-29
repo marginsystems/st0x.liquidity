@@ -40,6 +40,7 @@ pub(crate) const WORKER_CIRCUIT_POLICY: WorkerCircuitPolicy = WorkerCircuitPolic
 );
 
 pub(crate) const JOB_RETRIES: usize = 3;
+pub(crate) const JOB_MAX_ATTEMPTS: u32 = 25;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct WorkerCircuitPolicy {
@@ -174,16 +175,10 @@ impl RecoveringWorkerCircuit {
                     );
                 }
                 Err(error) => {
-                    *state
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                        WorkerCircuitState::Closed {
-                        consecutive_failures: 0,
-                    };
                     error!(
                         worker = %worker.name(),
                         ?error,
-                        "Worker circuit cooldown elapsed but the worker could not resume; circuit closed"
+                        "Worker circuit cooldown elapsed but the worker could not resume; circuit remains open"
                     );
                 }
             }
@@ -373,7 +368,9 @@ impl<Task: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static> JobQueu
     }
 
     pub(crate) async fn push(&mut self, task: Task) -> Result<(), QueuePushError> {
-        let task = TaskBuilder::<Task, SqliteContext, _>::new(task).build();
+        let task = TaskBuilder::<Task, SqliteContext, _>::new(task)
+            .max_attempts(JOB_MAX_ATTEMPTS)
+            .build();
         Ok(TaskSink::push_task(&mut self.0, task).await?)
     }
 
@@ -388,6 +385,7 @@ impl<Task: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static> JobQueu
         delay: Duration,
     ) -> Result<(), QueuePushError> {
         let scheduled = TaskBuilder::<Task, SqliteContext, _>::new(task)
+            .max_attempts(JOB_MAX_ATTEMPTS)
             .run_after(delay)
             .build();
         Ok(TaskSink::push_task(&mut self.0, scheduled).await?)
